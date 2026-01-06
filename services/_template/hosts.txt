@@ -1,0 +1,8 @@
+# Service hosts (FQDN)
+# - One host per line
+# - Lines starting with # are comments
+#
+# Examples:
+# example.com
+# api.example.com
+

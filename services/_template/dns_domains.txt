@@ -1,0 +1,7 @@
+# DNS override domains for /etc/resolver
+# - One base domain per line (no subdomains)
+# - Lines starting with # are comments
+#
+# Examples:
+# example.com
+

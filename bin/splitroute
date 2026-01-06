@@ -1,0 +1,146 @@
+#!/bin/bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SCRIPTS_DIR="$ROOT_DIR/scripts"
+SERVICES_DIR="$ROOT_DIR/services"
+
+DEFAULT_SERVICE="${DEFAULT_SERVICE:-openai}"
+
+usage() {
+  cat <<EOF
+splitroute (macOS) — selective routing via hotspot
+
+Usage:
+  splitroute help
+  splitroute list
+  splitroute on [service]
+  splitroute off [service]
+  splitroute refresh [service]
+  splitroute check [service] [-- <args to splitroute_check.sh>]
+  splitroute control [service] [--control-host <host>]
+  splitroute new-service <service>
+  splitroute edit [service]
+
+Notes:
+  - Commands that touch routing/DNS use sudo (you'll be prompted).
+  - Service is a folder under: services/<service>/
+
+Env:
+  DEFAULT_SERVICE=openai
+  You can also pass through common vars like WIFI_IF, ETH_IF, DNS_OVERRIDE, DNS_OVERRIDE_DEFAULT, DNS_SERVERS, DNS_DOMAINS.
+EOF
+}
+
+die() { echo "Error: $*" >&2; exit 1; }
+
+validate_service() {
+  local svc="$1"
+  [[ -n "$svc" ]] || die "Missing service name"
+  [[ "$svc" =~ ^[A-Za-z0-9._-]+$ ]] || die "Invalid service name: $svc"
+}
+
+service_dir() {
+  local svc="$1"
+  printf "%s/%s" "$SERVICES_DIR" "$svc"
+}
+
+run_with_sudo() {
+  local svc="$1"; shift
+  local script="$1"; shift
+
+  local envs=()
+  envs+=("SERVICE=$svc")
+
+  # Pass through selected optional env vars if set.
+  local v
+  for v in WIFI_IF ETH_IF VERBOSE DNS_OVERRIDE DNS_OVERRIDE_DEFAULT DNS_SERVERS DNS_DOMAINS DNS_DOMAINS_FILE DNS_FLUSH CONNECT_TIMEOUT MAX_TIME; do
+    if [[ -n "${!v:-}" ]]; then
+      envs+=("$v=${!v}")
+    fi
+  done
+
+  exec sudo "${envs[@]}" "$script" "$@"
+}
+
+cmd="${1:-help}"
+shift || true
+
+case "$cmd" in
+  -h|--help|help)
+    usage
+    exit 0
+    ;;
+  list)
+    if [[ ! -d "$SERVICES_DIR" ]]; then
+      exit 0
+    fi
+    find "$SERVICES_DIR" -mindepth 1 -maxdepth 1 -type d -print | sed -E 's|.*/||' | sort
+    ;;
+  on|enable)
+    svc="${1:-$DEFAULT_SERVICE}"
+    validate_service "$svc"
+    [[ -x "$SCRIPTS_DIR/splitroute_on.sh" ]] || die "Missing script: $SCRIPTS_DIR/splitroute_on.sh"
+    [[ -d "$(service_dir "$svc")" ]] || die "Missing service dir: $(service_dir "$svc")"
+    run_with_sudo "$svc" "$SCRIPTS_DIR/splitroute_on.sh"
+    ;;
+  off|disable)
+    svc="${1:-$DEFAULT_SERVICE}"
+    validate_service "$svc"
+    [[ -x "$SCRIPTS_DIR/splitroute_off.sh" ]] || die "Missing script: $SCRIPTS_DIR/splitroute_off.sh"
+    run_with_sudo "$svc" "$SCRIPTS_DIR/splitroute_off.sh"
+    ;;
+  refresh)
+    svc="${1:-$DEFAULT_SERVICE}"
+    validate_service "$svc"
+    [[ -x "$SCRIPTS_DIR/splitroute_on.sh" ]] || die "Missing script: $SCRIPTS_DIR/splitroute_on.sh"
+    [[ -d "$(service_dir "$svc")" ]] || die "Missing service dir: $(service_dir "$svc")"
+    run_with_sudo "$svc" "$SCRIPTS_DIR/splitroute_on.sh"
+    ;;
+  check|status)
+    svc="$DEFAULT_SERVICE"
+    if [[ $# -gt 0 && "${1:-}" != "--" && "${1:-}" != -* ]]; then
+      svc="$1"
+      shift
+    fi
+    validate_service "$svc"
+    [[ -x "$SCRIPTS_DIR/splitroute_check.sh" ]] || die "Missing script: $SCRIPTS_DIR/splitroute_check.sh"
+    if [[ "${1:-}" == "--" ]]; then shift; fi
+    run_with_sudo "$svc" "$SCRIPTS_DIR/splitroute_check.sh" "$@"
+    ;;
+  control)
+    svc="$DEFAULT_SERVICE"
+    if [[ $# -gt 0 && "${1:-}" != "--" && "${1:-}" != -* ]]; then
+      svc="$1"
+      shift
+    fi
+    validate_service "$svc"
+    [[ -x "$SCRIPTS_DIR/splitroute_check.sh" ]] || die "Missing script: $SCRIPTS_DIR/splitroute_check.sh"
+    run_with_sudo "$svc" "$SCRIPTS_DIR/splitroute_check.sh" --control "$@"
+    ;;
+  edit)
+    svc="${1:-$DEFAULT_SERVICE}"
+    validate_service "$svc"
+    hosts_file="$(service_dir "$svc")/hosts.txt"
+    [[ -f "$hosts_file" ]] || die "Missing hosts file: $hosts_file"
+    if [[ -n "${EDITOR:-}" ]]; then
+      exec "$EDITOR" "$hosts_file"
+    fi
+    echo "$hosts_file"
+    echo "Tip: set EDITOR=vim (or nano/code) and run: splitroute edit $svc"
+    ;;
+  new-service)
+    svc="${1:-}"
+    validate_service "$svc"
+    template_dir="$SERVICES_DIR/_template"
+    target_dir="$(service_dir "$svc")"
+    [[ -d "$template_dir" ]] || die "Missing template: $template_dir"
+    [[ ! -e "$target_dir" ]] || die "Service already exists: $target_dir"
+    cp -R "$template_dir" "$target_dir"
+    echo "Created: $target_dir"
+    echo "Next: edit $target_dir/hosts.txt and $target_dir/dns_domains.txt"
+    ;;
+  *)
+    die "Unknown command: $cmd (run: splitroute help)"
+    ;;
+esac

@@ -1,0 +1,23 @@
+# rdzeń
+chatgpt.com
+www.chatgpt.com
+chat.openai.com
+api.openai.com
+platform.openai.com
+developers.openai.com
+openai.com
+platform.api.openai.org
+
+# logowanie
+auth.openai.com
+setup.auth.openai.com
+auth0.openai.com
+
+# zasoby / upload
+oaistatic.com
+cdn.oaistatic.com
+oaiusercontent.com
+files.oaiusercontent.com
+
+# czasem wymagane przy wyzwaniach ochrony
+challenges.cloudflare.com
