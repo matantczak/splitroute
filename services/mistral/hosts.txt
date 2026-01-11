@@ -1,0 +1,22 @@
+# core
+mistral.ai
+www.mistral.ai
+
+# Le Chat / web app
+lechat.mistral.ai
+chat.mistral.ai
+canvas-chat.mistral.ai
+
+# API / console / auth
+auth.mistral.ai
+api.mistral.ai
+console.mistral.ai
+
+# docs / help / status
+docs.mistral.ai
+help.mistral.ai
+kb.mistral.ai
+learn.mistral.ai
+status.mistral.ai
+trust.mistral.ai
+legal.mistral.ai

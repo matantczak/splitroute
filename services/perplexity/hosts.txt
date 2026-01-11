@@ -1,0 +1,11 @@
+# core
+perplexity.ai
+www.perplexity.ai
+api.perplexity.ai
+
+# short links / redirects
+pplx.ai
+
+# static assets (from cert transparency)
+pplx-next-static-public.perplexity.ai
+r2cdn.perplexity.ai

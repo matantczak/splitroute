@@ -203,6 +203,39 @@ Plany na przyszłość (świadomie **nie** w tej wersji):
 - opcjonalny tryb „auto‑refresh” (np. co 15 min lub przy zmianie sieci)
 - tryb „always clean after reboot” (LaunchDaemon/helper)
 
+## Menu‑bar app (lokalnie)
+
+W repo jest prosta aplikacja menu‑bar `SplitrouteMenuBar` (AppKit), która steruje skryptami `splitroute` z górnego paska macOS.
+
+Build + uruchomienie:
+```bash
+bash scripts/build_menubar_app.sh
+open build/SplitrouteMenuBar.app
+```
+
+Workflow (po zmianach: build + install + uruchom + paczka):
+```bash
+bash scripts/workflow_menubar_app.sh
+# lub (jesli chcesz instalowac do /Applications)
+sudo bash scripts/workflow_menubar_app.sh
+```
+
+Pakowanie do DMG (instalacja przez przeciagniecie do Applications):
+```bash
+bash scripts/package_menubar_app.sh
+open build/SplitrouteMenuBar.dmg
+```
+Jeśli DMG nie da sie zrobic, skrypt stworzy `build/SplitrouteMenuBar.zip` (instalacja: rozpakuj i przeciagnij appke do Applications).
+
+Uwagi:
+- Jeśli appka nie wykryje automatycznie repo, użyj `Set Repo Path…`.
+- `Services` pozwala zaznaczyć wiele usług naraz; `ON/OFF/REFRESH/STATUS/VERIFY` działają na zaznaczone.
+- `Services -> Add Service…` tworzy nową usługę na podstawie domeny i od razu ją włącza.
+- `Auth -> Touch ID (sudo)` działa, gdy Touch ID jest włączone dla `sudo` (w `/etc/pam.d/sudo` jest `pam_tid.so`). W przeciwnym razie wybierz `Password prompt (system dialog)`.
+- Auto‑OFF po uśpieniu wykona się po wybudzeniu (może poprosić o autoryzację).
+- Po przełączeniu `ON/OFF` przeglądarka może trzymać istniejące połączenia — do testów zrób pełne wyjście (`Cmd+Q`) albo użyj `STATUS/VERIFY`.
+- Żeby mieć ją „jak normalną appkę”: skopiuj do `~/Applications/` albo zainstaluj do `/Applications/` przez `bash scripts/install_menubar_app.sh` (może wymagać `sudo`), a potem dodaj do Login Items.
+
 ## Publikacja na GitHub
 
 Przed publikacją warto:

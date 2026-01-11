@@ -44,3 +44,11 @@ Rozwiązanie: `./bin/splitroute off openai` (albo podłącz hotspot ponownie i z
 Tak — docelowo.
 Jeśli widzisz problemy tylko przy wpiętym Ethernecie, najczęstszą przyczyną jest DNS blokowany po Ethernecie, a nie routing.
 Patrz: `docs/case-study-openai.md`.
+
+## Dlaczego po `off` ChatGPT w przeglądarce czasem jeszcze „działa”?
+Najczęściej to efekt **utrzymanych istniejących połączeń** w przeglądarce (HTTP/2 / WebSocket / QUIC): zmiana routingu/DNS nie przestawia już zestawionych sesji.
+
+Jak testować poprawnie:
+- zrób `splitroute off`, a potem zamknij przeglądarkę całkowicie (`Cmd+Q`) i otwórz ją ponownie (albo użyj okna prywatnego),
+- zweryfikuj stan w terminalu: `./bin/splitroute check openai -- --host chatgpt.com --no-curl` (po `off` `route_if` nie powinno być hotspota),
+- pamiętaj: `off` usuwa host‑route’y i `/etc/resolver`, ale **nie wyłącza** interfejsu hotspota — jeśli macOS z jakiegoś powodu wybierze Wi‑Fi jako trasę domyślną, część ruchu może i tak pójść przez hotspot.
