@@ -19,3 +19,8 @@ build/
 services/cursor/dns_domains.txt
 services/cursor/dns_resolve_servers.txt
 services/cursor/hosts.txt
+
+# Local/private planning notes (do not publish)
+docs/roadmap-watchlist.md
+docs/_private/
+notes/
