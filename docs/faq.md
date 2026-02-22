@@ -1,54 +1,62 @@
 # FAQ
 
-## Czy to jest bezpieczne? Czy HTTPS nadal jest szyfrowany?
-Tak: HTTPS/TLS nadal działa end‑to‑end. Ten projekt nie instaluje certyfikatów i nie robi MITM.
-Zmieniamy tylko routing (host‑route’y) oraz opcjonalnie per‑domenowy DNS resolver (/etc/resolver), żeby domeny rozwiązywały się do poprawnych IP.
+## Is this safe? Does HTTPS stay encrypted?
+Yes. HTTPS/TLS remains end-to-end encrypted. This project does not install certificates and does not perform MITM.
 
-## Skąd wiem, że weryfikacja certyfikatu jest włączona?
-W `splitroute_check.sh` w sekcji `HTTPS probes` jest pole `tls_verify`.
-W `curl` wartość `0` oznacza sukces weryfikacji (`ssl_verify_result == 0`).
+## How can I verify certificate validation is enabled?
+In `splitroute_check.sh`, the HTTPS probe reports `tls_verify`.
+For `curl`, `tls_verify=0` means certificate verification succeeded (`ssl_verify_result == 0`).
 
-## Czy mam pewność, że tylko OpenAI idzie przez hotspot, a reszta przez Ethernet?
-W tej implementacji routing jest **po IP**: dodajemy host‑route’y tylko dla IP rozwiązywanych z listy domen usługi.
-To oznacza, że „zwykły ruch” idzie dalej trasą domyślną (np. Ethernet), a ruch do tych konkretnych IP pójdzie przez hotspot.
+## Can I be sure only selected services go through hotspot?
+This implementation routes by IP. It adds host routes only for IPs resolved from each service host list.
+Most traffic still follows your default route; selected service IPs follow hotspot routes.
 
-Uwaga praktyczna: jeśli CDN współdzieli IP między usługami, to bardzo rzadko może się zdarzyć, że inna usługa korzystająca z tego samego IP też poleci przez hotspot. To ograniczenie podejścia „route by IP”.
+Rare edge case: if a CDN IP is shared by multiple products, another service on the same IP may also use hotspot.
 
-## Czy te IP mogą się zmienić?
-Tak. Serwisy za CDN (np. Cloudflare) mogą zmieniać IP w czasie.
-Jeśli w trakcie sesji pojawią się nowe IP, których nie ma w dodanych trasach, część nowych połączeń może wrócić na domyślną trasę.
-Dlatego jest `Refresh`:
-- `./bin/splitroute refresh openai` (odświeża resolve i trasy)
+## Do service IPs change?
+Yes. CDN-backed services can rotate IPs.
+When routing starts to degrade, run:
+```bash
+./bin/splitroute refresh <service>
+```
 
-## Dlaczego czasem potrzebny jest DNS override (/etc/resolver)?
-Bo niektóre sieci (często firmowe) podmieniają odpowiedzi DNS dla wybranych domen, np. na stronę blokady (typowo `146.112.61.x` dla Cisco Umbrella/OpenDNS).
-Wtedy nawet poprawny routing prowadzi do „złego” IP, a TLS może failować.
-Per‑domain resolvery pozwalają rozwiązywać tylko wybrane domeny przez inny DNS.
+## Why is DNS override sometimes needed?
+Some networks return blocked-page DNS responses (for example `146.112.61.x` from Umbrella/OpenDNS).
+In that case routing can look correct but still point to wrong destination IPs.
+Per-domain resolvers under `/etc/resolver` solve this for selected domains.
 
-## Dlaczego czasem trzeba zrobić `refresh` po podpięciu Ethernetu?
-Domyślnie używamy `DNS_OVERRIDE=on`, więc zwykle problem nie występuje.
-Jeśli jednak uruchomisz usługę z `DNS_OVERRIDE=auto` albo `DNS_OVERRIDE=off`, to pamiętaj że po podpięciu Ethernetu systemowy DNS może się zmienić (i np. zacząć zwracać `146.112.61.x`).
-Wtedy zrób:
-- `DNS_OVERRIDE=on ./bin/splitroute refresh openai`
+## Why do I sometimes need refresh after connecting Ethernet?
+If DNS context changes after network switch, newly resolved IPs can differ.
+Use:
+```bash
+DNS_OVERRIDE=on ./bin/splitroute refresh <service>
+```
 
-## Czy to zostawia „ślady” po restarcie?
-- Host‑route’y znikają po restarcie same.
-- Pliki `/etc/resolver/*` są na dysku i mogą zostać, jeśli zrestartujesz komputer w trybie ON bez `off`.
-W tej wersji `splitroute off` sprząta wszystko, a `splitroute_off.sh` ma fallback usuwania plików z markerem nawet jeśli `/tmp` zniknęło po restarcie.
+## Does splitroute leave anything after reboot?
+- Host routes disappear on reboot.
+- `/etc/resolver` files are on disk until cleaned.
+- `splitroute off` cleans routes and managed resolver files.
+- The menu bar app now resets stale splitroute state at startup (admin auth required).
 
-## Co jeśli odłączę hotspot w trybie ON?
-W tej wersji host‑route’y są statyczne: jeśli hotspot zniknie, a routy nadal wskazują jego bramę, to połączenia do IP tej usługi mogą przestać działać.
-Rozwiązanie: `./bin/splitroute off openai` (albo podłącz hotspot ponownie i zrób `refresh`).
+## What happens if hotspot disconnects while ON?
+Static routes can point to an unavailable gateway and service traffic may fail.
+Fix:
+```bash
+./bin/splitroute off <service>
+```
+or reconnect hotspot and run `refresh`.
 
-## Czy to działa z Codex CLI i przeglądarką?
-Tak — docelowo.
-Jeśli widzisz problemy tylko przy wpiętym Ethernecie, najczęstszą przyczyną jest DNS blokowany po Ethernecie, a nie routing.
-Patrz: `docs/case-study-openai.md`.
+## Do you automatically delete my saved hosts/services?
+No. Service files under `services/<service>/` are never auto-deleted by ON/OFF/restart cleanup.
+You delete them only manually.
 
-## Dlaczego po `off` ChatGPT w przeglądarce czasem jeszcze „działa”?
-Najczęściej to efekt **utrzymanych istniejących połączeń** w przeglądarce (HTTP/2 / WebSocket / QUIC): zmiana routingu/DNS nie przestawia już zestawionych sesji.
+## Why can browser traffic still work briefly after OFF?
+Browsers may keep existing connections alive (HTTP/2, WebSocket, QUIC).
+To test cleanly:
+- run `off`
+- fully quit browser (`Cmd+Q`)
+- reopen and test again
 
-Jak testować poprawnie:
-- zrób `splitroute off`, a potem zamknij przeglądarkę całkowicie (`Cmd+Q`) i otwórz ją ponownie (albo użyj okna prywatnego),
-- zweryfikuj stan w terminalu: `./bin/splitroute check openai -- --host chatgpt.com --no-curl` (po `off` `route_if` nie powinno być hotspota),
-- pamiętaj: `off` usuwa host‑route’y i `/etc/resolver`, ale **nie wyłącza** interfejsu hotspota — jeśli macOS z jakiegoś powodu wybierze Wi‑Fi jako trasę domyślną, część ruchu może i tak pójść przez hotspot.
+## Does this work with Codex CLI and browsers?
+Yes, that is the intended use case.
+If behavior differs between links, DNS policy on the Ethernet side is usually the main cause.

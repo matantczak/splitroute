@@ -30,6 +30,12 @@ DNS_OVERRIDE="${DNS_OVERRIDE:-$DNS_OVERRIDE_DEFAULT}" # auto|on|off
 DNS_SERVERS="${DNS_SERVERS:-1.1.1.1 1.0.0.1}"
 DNS_DOMAINS="${DNS_DOMAINS:-}"
 DNS_FLUSH="${DNS_FLUSH:-1}"
+DNS_RESOLVE_SERVERS="${DNS_RESOLVE_SERVERS:-}"
+DNS_RESOLVE_SERVERS_FILE="${DNS_RESOLVE_SERVERS_FILE:-$SERVICE_DIR/dns_resolve_servers.txt}"
+
+if [[ -z "${DNS_RESOLVE_SERVERS:-}" && -f "$DNS_RESOLVE_SERVERS_FILE" ]]; then
+  DNS_RESOLVE_SERVERS="$(awk 'NF && $1 !~ /^#/{print $1}' "$DNS_RESOLVE_SERVERS_FILE" | tr '\n' ' ')"
+fi
 
 if [[ $EUID -ne 0 ]]; then
   echo "Uruchom tak: sudo $0"
@@ -203,6 +209,11 @@ resolve_v4() {
     if [[ "$DNS_OVERRIDE_ENABLED" -eq 0 ]]; then
       dig +short A "$host" 2>/dev/null | grep -E '^[0-9.]+$' || true
     fi
+    if [[ -n "${DNS_RESOLVE_SERVERS:-}" && -x "$(command -v dig)" ]]; then
+      for ns in $DNS_RESOLVE_SERVERS; do
+        dig +short A "$host" @"$ns" +time=1 +tries=1 2>/dev/null | grep -E '^[0-9.]+$' || true
+      done
+    fi
   } | sort -u
 }
 
@@ -213,7 +224,20 @@ resolve_v6() {
     if [[ "$DNS_OVERRIDE_ENABLED" -eq 0 ]]; then
       dig +short AAAA "$host" 2>/dev/null | grep -E ':' || true
     fi
+    if [[ -n "${DNS_RESOLVE_SERVERS:-}" && -x "$(command -v dig)" ]]; then
+      for ns in $DNS_RESOLVE_SERVERS; do
+        dig +short AAAA "$host" @"$ns" +time=1 +tries=1 2>/dev/null | grep -E ':' || true
+      done
+    fi
   } | sort -u
+}
+
+is_ipv4() {
+  [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]
+}
+
+is_ipv6() {
+  [[ "$1" == *:* && "$1" =~ ^[0-9A-Fa-f:]+$ ]]
 }
 
 TMP_IPS="$(mktemp)"
@@ -223,6 +247,15 @@ trap cleanup EXIT
 while read -r host; do
   [[ -z "$host" ]] && continue
   [[ "$host" =~ ^# ]] && continue
+
+  if is_ipv4 "$host"; then
+    echo -e "v4\t$host" >> "$TMP_IPS"
+    continue
+  fi
+  if is_ipv6 "$host"; then
+    echo -e "v6\t$host" >> "$TMP_IPS"
+    continue
+  fi
 
   # IPv4
   resolve_v4 "$host" | awk '{print "v4\t"$0}' >> "$TMP_IPS"

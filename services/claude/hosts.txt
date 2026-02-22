@@ -1,0 +1,25 @@
+# core
+claude.ai
+www.claude.ai
+
+# API
+api.anthropic.com
+
+# console / web app
+console.anthropic.com
+
+# auth
+auth.claude.ai
+
+# user content / uploads
+claudeusercontent.com
+
+# MCP client
+claudemcpclient.com
+
+# status
+status.anthropic.com
+
+# parent domain
+anthropic.com
+www.anthropic.com

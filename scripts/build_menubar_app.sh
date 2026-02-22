@@ -29,6 +29,8 @@ xcrun --sdk macosx swiftc \
   -parse-as-library \
   -O \
   -framework Cocoa \
+  -framework Network \
+  -framework UserNotifications \
   "$SRC_DIR/SplitrouteMenuBar.swift" \
   -o "$MACOS_DIR/$APP_NAME"
 

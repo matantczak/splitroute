@@ -1,117 +1,92 @@
-# Migracja z „home scripts” do repo `splitroute`
+# Migration from Home Scripts to `splitroute`
 
-Ten dokument jest checklistą migracji z plików w katalogu domowym:
+This guide helps migrate from old files in your home directory, for example:
 - `~/openai_on.sh`
 - `~/openai_off.sh`
 - `~/openai_check.sh`
 - `~/openai_hosts.txt`
 
-…na nowe repo `splitroute` (sklonowane/umieszczone gdziekolwiek).
+to the repository-based workflow in `splitroute`.
 
-## Dlaczego ta migracja wymaga ostrożności
+## Why migration needs care
 
-W trakcie rozmowy wyszło, że w sieci po Ethernecie DNS mógł być podmieniany (np. Umbrella/OpenDNS → `146.112.61.x`).
-W takim układzie **wyłączenie** starego trybu (`openai_off.sh`) może chwilowo „odciąć” OpenAI/ChatGPT/Codex, dopóki nie włączysz nowego trybu w `splitroute`.
+If Ethernet-side DNS is filtered/rewritten (for example to `146.112.61.x`), switching tools can briefly interrupt access until the new setup is enabled.
 
-Dlatego poniżej są dwie ścieżki:
-- **A (zalecana):** migracja bez ryzyka utraty dostępu — na czas przełączenia odłącz Ethernet.
-- **B:** szybka migracja bez odłączania — wymaga gotowych komend „kopiuj‑wklej”.
+## Before You Start
 
-## Przed startem
-
-1) Otwórz ten plik lokalnie (offline), żeby mieć instrukcję nawet bez dostępu do OpenAI:
-`docs/migration.md`
-
-2) Upewnij się, że projekt działa:
+1. Open this file locally so you can follow it offline.
+2. Verify the new repo works:
 ```bash
 cd /path/to/splitroute
 ./bin/splitroute list
 ./bin/splitroute help
 ```
 
-## A) Zalecane: migracja bez przerwy w dostępie (odłącz Ethernet na chwilę)
+## Path A (recommended): no access gap
 
-1) **Odłącz Ethernet** (wyjmij kabel/dock lub wyłącz interfejs), tak żeby jedynym łączem był hotspot (`en0`).
-   - W tym momencie nawet bez split‑routingu OpenAI powinno działać normalnie przez hotspot.
-
-2) Wyłącz stary tryb i posprzątaj:
+1. Disconnect Ethernet temporarily, keep hotspot connected.
+2. Disable old mode:
 ```bash
 sudo ~/openai_off.sh
 ```
-
-3) Włącz nowy tryb (OpenAI) w repo:
+3. Enable new mode:
 ```bash
 cd /path/to/splitroute
 ./bin/splitroute on openai
 ```
-
-4) (Opcjonalnie) Zweryfikuj na hotspocie:
+4. Optional quick check:
 ```bash
 ./bin/splitroute check openai -- --host chatgpt.com --control --no-curl
 ```
-
-5) **Podłącz Ethernet z powrotem** i sprawdź split‑routing:
+5. Reconnect Ethernet and verify:
 ```bash
-cd /path/to/splitroute
 ./bin/splitroute check openai -- --host chatgpt.com --control
 ```
-Jeśli zobaczysz IP `146.112.61.x` (Umbrella/OpenDNS) albo błąd certyfikatu w `curl`, wykonaj:
+6. If blocked DNS appears (`146.112.61.x`) or cert errors show up:
 ```bash
-cd /path/to/splitroute && DNS_OVERRIDE=on ./bin/splitroute refresh openai
+DNS_OVERRIDE=on ./bin/splitroute refresh openai
 ```
-…i powtórz `check`.
 
-## B) Alternatywnie: migracja „na żywo” bez odłączania Ethernetu (może być krótkie okno braku dostępu)
+## Path B: live switch (may cause short gap)
 
-1) Skopiuj poniższe 2 komendy do schowka, żeby wkleić je od razu jedna po drugiej:
-
-Wyłącz stare:
+Prepare and run quickly:
 ```bash
 sudo ~/openai_off.sh
-```
-
-Włącz nowe:
-```bash
 cd /path/to/splitroute && ./bin/splitroute on openai
 ```
 
-2) Po włączeniu — weryfikacja:
+Then verify:
 ```bash
 cd /path/to/splitroute && ./bin/splitroute check openai -- --host chatgpt.com --control
 ```
 
-## Po migracji: czyszczenie i usuwanie starych plików
+## Post-Migration Cleanup
 
-1) Upewnij się, że `off` działa z nowego projektu:
+1. Verify new OFF path:
 ```bash
 cd /path/to/splitroute && ./bin/splitroute off openai
 ```
 
-2) Upewnij się, że nie ma już starych plików `/etc/resolver` (marker starego narzędzia):
+2. Check old resolver artifacts:
 ```bash
 sudo grep -R "openai_splitrouting_managed" /etc/resolver 2>/dev/null || true
 ```
-Jeśli coś się pojawi, uruchom jeszcze raz:
+
+3. If anything remains, run old cleanup once:
 ```bash
 sudo ~/openai_off.sh
 ```
 
-3) Dopiero teraz usuń stare pliki z katalogu domowego (jeśli chcesz):
-- `~/openai_on.sh`
-- `~/openai_off.sh`
-- `~/openai_check.sh`
-- `~/openai_hosts.txt`
+4. Remove old home scripts when comfortable.
 
-Rekomendacja praktyczna: zostaw je 1–2 dni jako „plan awaryjny”, a potem usuń.
+## Emergency Recovery
 
-## Jak odpalić nowy tryb, jeśli coś nagle przestanie działać
-
-Najkrótsza ścieżka:
+Fast path:
 ```bash
 cd /path/to/splitroute && ./bin/splitroute refresh openai
 ```
 
-Jeśli podejrzewasz DNS blokowany po Ethernecie (np. powrót `146.112.61.x`):
+If DNS rewriting is suspected:
 ```bash
 cd /path/to/splitroute && DNS_OVERRIDE=on ./bin/splitroute refresh openai
 ```

@@ -1,111 +1,91 @@
-# Case study: OpenAI/ChatGPT/Codex split‑routing on macOS
+# Case Study: OpenAI/ChatGPT/Codex Split Routing on macOS
 
-Ten dokument zapisuje „historię problemu” i wnioski z konfiguracji split‑routingu dla usług OpenAI na macOS.
-Powstał jako notatka utrwalająca kontekst diagnostyczny (żeby dało się to rozwijać i łatwo wrócić do rozumowania po przerwie).
+This note captures the real troubleshooting path and final architecture used for OpenAI traffic split-routing.
 
-## Cel
+## Goal
 
-Gdy jednocześnie aktywne są:
-- `en7` — Ethernet (dock) **jako domyślna trasa**,
-- `en0` — Wi‑Fi hotspot (iPhone),
+With both links active:
+- `en7` Ethernet as default route
+- `en0` iPhone hotspot on Wi-Fi
 
-to:
-- cały „zwykły internet” ma iść przez Ethernet (`en7`),
-- ale ruch do OpenAI/ChatGPT/Codex ma iść przez hotspot (`en0`),
-- ma być łatwe ON/OFF i sprzątanie stanu,
-- bez VPN i bez obniżania bezpieczeństwa TLS.
+we want:
+- normal internet via Ethernet
+- OpenAI-related traffic via hotspot
+- simple ON/OFF behavior
+- no TLS weakening and no MITM.
 
-## Objawy
+## Symptoms
 
-Przy wpiętym Ethernecie (domyślna trasa na `en7`):
-- Codex CLI w terminalu nie działał poprawnie,
-- przeglądarka czasem też nie otwierała `https://chatgpt.com/`,
-- mimo że host‑route dla `chatgpt.com` (IPv4) potrafił wskazywać interfejs `en0`.
+With Ethernet connected:
+- Codex CLI was unstable
+- browser sometimes failed to open `https://chatgpt.com/`
+- route checks could show `en0`, yet requests still failed
 
-Kluczowy sygnał diagnostyczny:
-- `curl` zwracał `SSL certificate problem: unable to get local issuer certificate` nawet przy próbie przez `--interface en0`.
+Strong signal:
+- `curl` showed certificate trust errors in some paths.
 
-## Co się okazało (przyczyna)
+## Root Cause
 
-Problemem nie był sam routing, tylko **DNS** w sieci po Ethernecie:
-- domeny (`chatgpt.com`, `api.openai.com`) rozwiązywały się do adresów typu `146.112.61.x`,
-- taki zakres jest często używany przez **Cisco Umbrella/OpenDNS** jako „blocked page”,
-- wtedy klient HTTPS trafia nie w prawdziwy endpoint (np. Cloudflare/OpenAI), tylko w stronę blokady,
-  co potrafi kończyć się błędem weryfikacji certyfikatu.
+The primary issue was DNS, not host-route mechanics.
+Some queries resolved to blocked-page IPs (for example `146.112.61.x`, commonly associated with Cisco Umbrella/OpenDNS policies).
 
-Wniosek: jeśli DNS jest „podmieniony”, to nawet poprawne host‑route’y mogą kierować do „złego” IP.
+So traffic was routed correctly to the wrong destination IP.
 
-## Rozwiązanie (co faktycznie naprawiło sytuację)
+## Working Fix
 
-W tej wersji projektu zrobiono dwa elementy:
+Two combined layers fixed it:
 
-1) **Routing po IP (host routes)** dla domen z `services/openai/hosts.txt`:
-- resolve A/AAAA → IP,
-- `route add -inet -host <ip> <GW_hotspot>` (nieskopowane, działa dla normalnych socketów),
-- opcjonalnie IPv6, jeśli hotspot ma wykrywalny IPv6 gateway.
+1. **Host routes by IP**
+- Resolve A/AAAA from `services/openai/hosts.txt`
+- Add host routes toward hotspot gateway
 
-2) **Per‑domain DNS override** dla domen z `services/openai/dns_domains.txt`, gdy wykryto typowe oznaki blokady DNS:
-- tworzone są pliki `/etc/resolver/<domain>` z markerem `splitroute_managed:openai`,
-- jako DNS wpisywany jest najpierw gateway hotspota, a potem publiczny fallback (domyślnie `1.1.1.1` i `1.0.0.1`),
-- po zmianie wykonywany jest flush cache DNS.
+2. **Per-domain DNS override**
+- Write managed files in `/etc/resolver/<domain>`
+- Source domains from `services/openai/dns_domains.txt`
+- Use hotspot gateway first, then public DNS fallback
 
-Właśnie ten drugi element (per‑domain resolver) był kluczowy dla usunięcia `146.112.61.x` i przywrócenia poprawnego TLS.
+This removed blocked DNS answers and restored correct TLS behavior.
 
-## Jak to potwierdzaliśmy (minimalny zestaw testów)
+## Minimal Validation Set
 
-### 1) Sprawdzenie domyślnej trasy
+1. Default route sanity:
 ```bash
 netstat -rn -f inet | head -n 6
 ```
-Oczekiwane: `default ... en7` (Ethernet jako default).
 
-### 2) Sprawdzenie, jakie IP daje systemowy resolver
+2. Resolver output sanity:
 ```bash
 dscacheutil -q host -a name chatgpt.com
 ```
-Oczekiwane: IP Cloudflare (np. `104.18.x.x` / `172.64.x.x`), **nie** `146.112.61.x`.
 
-### 3) Sprawdzenie interfejsu, którym system pójdzie do IP
+3. Interface decision for target IP:
 ```bash
-route -n get 104.18.32.47 | rg -n "gateway:|interface:"
+route -n get <target_ip> | rg -n "gateway:|interface:"
 ```
-Oczekiwane: `interface: en0` dla IP OpenAI/ChatGPT objętych split‑routingiem.
 
-### 4) Test „czy reszta internetu idzie domyślnie”
-`splitroute_check.sh` ma tryb kontrolny:
+4. Split vs control routing:
 ```bash
 ./bin/splitroute check openai -- --host chatgpt.com --control --no-curl
 ```
-Oczekiwane:
-- hosty OpenAI → `route_if=en0`,
-- host kontrolny (np. `example.com`/`youtube.com`) → `route_if` taki jak domyślna trasa (zwykle `en7`).
 
-### 5) Szybki probe HTTPS (bez nagłówków/tokens)
+5. HTTPS probe:
 ```bash
 ./bin/splitroute check openai -- --host chatgpt.com
 ```
-Oczekiwane: brak błędu certyfikatu, a `tls_verify=0` (czyli weryfikacja certyfikatu OK).
 
-Uwaga: `http=403` dla `https://chatgpt.com/` w `curl` jest normalne (Cloudflare/ochrona).
-Nie testujemy tu logowania ani sesji użytkownika — tylko to, że TLS i routing działają.
+## Safety Model
 
-## Dlaczego to jest bezpieczne
+The tool does **not**:
+- install certificates
+- set system proxy
+- perform MITM
+- disable TLS verification
 
-Ten projekt:
-- nie instaluje żadnych certyfikatów,
-- nie używa proxy MITM,
-- nie ustawia systemowych proxy,
-- nie wyłącza weryfikacji TLS (nie używa `curl -k`).
+It only changes routing entries and managed resolver files.
 
-Zmienia tylko:
-- tablicę routingu (host‑route’y),
-- opcjonalnie per‑domenowe resolvery DNS w `/etc/resolver`.
+## Practical Constraints
 
-## Ograniczenia, które wyszły w praktyce
-
-1) **CDN/IP rotacja**: IP mogą się zmieniać (TTL DNS, load‑balancing).
-   - jeśli coś przestaje działać, użyj `splitroute refresh openai`.
-2) **IP współdzielone (CDN)**: routing po IP może w rzadkich przypadkach „zabrać” też niepowiązany ruch do tego samego IP.
-3) **IPv6**: hotspot często nie daje IPv6 gateway → AAAA mogą mieć status `NO_V6_ON_en0`.
-4) **/etc/resolver po restarcie**: routy znikają, ale pliki resolver mogą zostać, jeśli nie wykonasz `off` przed restartem (patrz README).
-
+1. Routing is IP-based, not domain-native.
+2. CDN IP rotation requires refresh.
+3. IPv6 depends on hotspot capabilities.
+4. Resolver files can persist until cleanup.

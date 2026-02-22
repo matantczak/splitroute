@@ -1,0 +1,18 @@
+# Copilot API
+copilot-proxy.githubusercontent.com
+api.githubcopilot.com
+
+# telemetry / analytics
+copilot-telemetry.githubusercontent.com
+collector.github.com
+default.exp-tas.com
+origin-tracker.githubusercontent.com
+
+# auth (GitHub login)
+github.com
+api.github.com
+
+# Copilot subscription tiers
+individual.githubcopilot.com
+business.githubcopilot.com
+enterprise.githubcopilot.com

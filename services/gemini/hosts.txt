@@ -1,0 +1,13 @@
+# core
+gemini.google.com
+
+# AI Studio
+aistudio.google.com
+
+# Generative AI API
+generativelanguage.googleapis.com
+
+# related Google AI
+ai.google
+deepmind.google
+makersuite.google.com

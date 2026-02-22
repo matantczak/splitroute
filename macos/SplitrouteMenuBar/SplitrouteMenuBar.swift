@@ -1,14 +1,13 @@
 import Cocoa
 import Darwin
+import Network
+import UserNotifications
 
 private enum DefaultsKey {
   static let repoPath = "SplitrouteRepoPath"
   static let selectedService = "SplitrouteSelectedService" // legacy
   static let selectedServices = "SplitrouteSelectedServices"
   static let authMode = "SplitrouteAuthMode"
-  static let autoOffDeadline = "SplitrouteAutoOffDeadline"
-  static let autoOffService = "SplitrouteAutoOffService" // legacy
-  static let autoOffServices = "SplitrouteAutoOffServices"
 }
 
 private enum AuthMode: String {
@@ -227,13 +226,15 @@ private final class SplitrouteRunner {
   }
 }
 
-private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopoverDelegate {
+private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopoverDelegate, UNUserNotificationCenterDelegate {
   private let runner = SplitrouteRunner()
 
   private var statusItem: NSStatusItem?
   private var outputPopover: NSPopover?
-  private var autoOffTimer: Timer?
   private var isBusy = false
+  private var pathMonitor: NWPathMonitor?
+  private var lastPathDescription = ""
+  private var networkDebounceWork: DispatchWorkItem?
 
   func applicationDidFinishLaunching(_ notification: Notification) {
     NSApp.setActivationPolicy(.accessory)
@@ -245,24 +246,224 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
       button.toolTip = "splitroute"
     }
 
+    updateStatusIcon()
     rebuildMenu()
-
-    NSWorkspace.shared.notificationCenter.addObserver(
-      self,
-      selector: #selector(handleWake),
-      name: NSWorkspace.didWakeNotification,
-      object: nil
-    )
-
-    rescheduleAutoOffTimer()
-    checkAutoOffIfNeeded(reason: "launch")
+    requestNotificationAuthorizationIfNeeded()
+    cleanupStaleSplitrouteStateIfNeeded()
+    startNetworkMonitor()
   }
 
   func menuWillOpen(_ menu: NSMenu) {
+    updateStatusIcon()
     rebuildMenu()
   }
 
   private func defaults() -> UserDefaults { .standard }
+
+  // MARK: - Status icon
+
+  private func isRoutingActive() -> Bool {
+    if !servicesFromStateFiles(suffix: "_routes.txt").isEmpty { return true }
+    if !servicesFromManagedResolvers().isEmpty { return true }
+    return false
+  }
+
+  private func servicesFromStateFiles(suffix: String) -> [String] {
+    let tmpDir = URL(fileURLWithPath: "/tmp", isDirectory: true)
+    guard let entries = try? FileManager.default.contentsOfDirectory(
+      at: tmpDir,
+      includingPropertiesForKeys: nil,
+      options: [.skipsHiddenFiles]
+    ) else { return [] }
+
+    var services = Set<String>()
+    for entry in entries {
+      guard let service = serviceNameFromStateFile(entry.lastPathComponent, suffix: suffix) else { continue }
+      services.insert(service)
+    }
+    return services.sorted()
+  }
+
+  private func serviceNameFromStateFile(_ name: String, suffix: String) -> String? {
+    let prefix = "splitroute_"
+    guard name.hasPrefix(prefix), name.hasSuffix(suffix) else { return nil }
+
+    let start = name.index(name.startIndex, offsetBy: prefix.count)
+    let end = name.index(name.endIndex, offsetBy: -suffix.count)
+    guard start < end else { return nil }
+
+    let service = String(name[start..<end])
+    guard !service.isEmpty else { return nil }
+    let allowed = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
+    guard service.rangeOfCharacter(from: allowed.inverted) == nil else { return nil }
+    return service
+  }
+
+  private func servicesFromManagedResolvers() -> [String] {
+    let resolverDir = URL(fileURLWithPath: "/etc/resolver", isDirectory: true)
+    guard let entries = try? FileManager.default.contentsOfDirectory(
+      at: resolverDir,
+      includingPropertiesForKeys: [.isRegularFileKey],
+      options: [.skipsHiddenFiles]
+    ) else { return [] }
+
+    var services = Set<String>()
+    for entry in entries {
+      guard (try? entry.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true else { continue }
+      guard let text = try? String(contentsOf: entry, encoding: .utf8) else { continue }
+
+      for rawLine in text.split(separator: "\n", omittingEmptySubsequences: false) {
+        let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let markerRange = line.range(of: "splitroute_managed:") else { continue }
+        let suffix = line[markerRange.upperBound...]
+        guard let token = suffix.split(whereSeparator: { $0 == " " || $0 == "\t" || $0 == "#" }).first else { continue }
+        let service = String(token)
+        guard !service.isEmpty else { continue }
+        services.insert(service)
+      }
+    }
+    return services.sorted()
+  }
+
+  private func requestNotificationAuthorizationIfNeeded() {
+    let center = UNUserNotificationCenter.current()
+    center.getNotificationSettings { settings in
+      guard settings.authorizationStatus == .notDetermined else { return }
+      center.requestAuthorization(options: [.alert, .sound]) { _, _ in }
+    }
+  }
+
+  private func cleanupStaleSplitrouteStateIfNeeded() {
+    guard getRepoRoot() != nil else { return }
+
+    let routeStateServices = servicesFromStateFiles(suffix: "_routes.txt")
+    let resolverStateServices = servicesFromStateFiles(suffix: "_resolvers.txt")
+    let resolverServices = servicesFromManagedResolvers()
+
+    let staleServices = Set(routeStateServices + resolverStateServices + resolverServices).sorted()
+    guard !staleServices.isEmpty else { return }
+
+    runPrivileged(actionName: "RESET stale state", script: .off, services: staleServices) { _ in [] }
+  }
+
+  private func isHotspotReachable() -> Bool {
+    let proc = Process()
+    proc.executableURL = URL(fileURLWithPath: "/usr/sbin/ipconfig")
+    proc.arguments = ["getoption", "en0", "router"]
+    let pipe = Pipe()
+    proc.standardOutput = pipe
+    proc.standardError = FileHandle.nullDevice
+    do {
+      try proc.run()
+      proc.waitUntilExit()
+    } catch { return false }
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    let gw = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    return !gw.isEmpty
+  }
+
+  private func routeGoesToWifi(host: String) -> Bool {
+    let proc = Process()
+    proc.executableURL = URL(fileURLWithPath: "/sbin/route")
+    proc.arguments = ["-n", "get", host]
+    let pipe = Pipe()
+    proc.standardOutput = pipe
+    proc.standardError = FileHandle.nullDevice
+    do {
+      try proc.run()
+      proc.waitUntilExit()
+    } catch { return false }
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    let output = String(data: data, encoding: .utf8) ?? ""
+    for line in output.split(separator: "\n") {
+      let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+      if trimmed.hasPrefix("interface:") {
+        let iface = trimmed.replacingOccurrences(of: "interface:", with: "").trimmingCharacters(in: .whitespacesAndNewlines)
+        return iface == "en0"
+      }
+    }
+    return false
+  }
+
+  private func updateStatusIcon() {
+    guard let button = statusItem?.button else { return }
+    let active = isRoutingActive()
+
+    if !active {
+      button.image = NSImage(systemSymbolName: "arrow.triangle.branch", accessibilityDescription: "splitroute — OFF")
+      button.image?.isTemplate = true
+      button.toolTip = "splitroute — OFF"
+      return
+    }
+
+    let hotspot = isHotspotReachable()
+    if hotspot {
+      let img = NSImage(systemSymbolName: "arrow.triangle.branch", accessibilityDescription: "splitroute — ON")
+      let config = NSImage.SymbolConfiguration(paletteColors: [.systemGreen])
+      button.image = img?.withSymbolConfiguration(config)
+      button.image?.isTemplate = false
+      button.toolTip = "splitroute — ON"
+    } else {
+      let img = NSImage(systemSymbolName: "exclamationmark.triangle", accessibilityDescription: "splitroute — no hotspot")
+      let config = NSImage.SymbolConfiguration(paletteColors: [.systemYellow])
+      button.image = img?.withSymbolConfiguration(config)
+      button.image?.isTemplate = false
+      button.toolTip = "splitroute — ON (no hotspot)"
+    }
+  }
+
+  // MARK: - Network monitor (event-driven, no polling)
+
+  private func startNetworkMonitor() {
+    let monitor = NWPathMonitor()
+    monitor.pathUpdateHandler = { [weak self] path in
+      let desc = path.availableInterfaces.map { $0.name }.sorted().joined(separator: ",")
+      DispatchQueue.main.async {
+        self?.handleNetworkPathUpdate(interfaceDesc: desc)
+      }
+    }
+    monitor.start(queue: DispatchQueue(label: "splitroute.network-monitor"))
+    pathMonitor = monitor
+  }
+
+  private func handleNetworkPathUpdate(interfaceDesc: String) {
+    guard interfaceDesc != lastPathDescription else { return }
+    let wasFirst = lastPathDescription.isEmpty
+    lastPathDescription = interfaceDesc
+
+    updateStatusIcon()
+
+    // Skip notification on first observation (launch)
+    guard !wasFirst else { return }
+    guard isRoutingActive() else { return }
+
+    // Debounce: wait 5s before showing notification
+    networkDebounceWork?.cancel()
+    let work = DispatchWorkItem { [weak self] in
+      self?.showNetworkChangeNotification()
+    }
+    networkDebounceWork = work
+    DispatchQueue.main.asyncAfter(deadline: .now() + 5, execute: work)
+  }
+
+  private func showNetworkChangeNotification() {
+    let center = UNUserNotificationCenter.current()
+    center.delegate = self
+
+    let content = UNMutableNotificationContent()
+    content.title = "splitroute"
+    content.body = "Network change detected. Refresh routing?"
+    content.categoryIdentifier = "NETWORK_CHANGE"
+
+    let refreshAction = UNNotificationAction(identifier: "REFRESH", title: "Refresh", options: [])
+    let category = UNNotificationCategory(identifier: "NETWORK_CHANGE", actions: [refreshAction], intentIdentifiers: [], options: [])
+    center.setNotificationCategories([category])
+
+    let request = UNNotificationRequest(identifier: "network-change-\(Date().timeIntervalSince1970)", content: content, trigger: nil)
+    center.add(request)
+  }
+
+  // MARK: - Repo & services
 
   private func getRepoRoot() -> URL? {
     if let s = defaults().string(forKey: DefaultsKey.repoPath), !s.isEmpty {
@@ -318,62 +519,6 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     defaults().set(mode.rawValue, forKey: DefaultsKey.authMode)
   }
 
-  private func autoOffDeadline() -> Date? {
-    let ts = defaults().double(forKey: DefaultsKey.autoOffDeadline)
-    if ts <= 0 { return nil }
-    return Date(timeIntervalSince1970: ts)
-  }
-
-  private func setAutoOff(deadline: Date?, services: [String]?) {
-    if let deadline, let services {
-      defaults().set(deadline.timeIntervalSince1970, forKey: DefaultsKey.autoOffDeadline)
-      defaults().set(services, forKey: DefaultsKey.autoOffServices)
-    } else {
-      defaults().removeObject(forKey: DefaultsKey.autoOffDeadline)
-      defaults().removeObject(forKey: DefaultsKey.autoOffServices)
-      defaults().removeObject(forKey: DefaultsKey.autoOffService)
-    }
-    rescheduleAutoOffTimer()
-  }
-
-  private func autoOffServices() -> [String]? {
-    if let list = defaults().array(forKey: DefaultsKey.autoOffServices) as? [String] {
-      return list
-    }
-    if let legacy = defaults().string(forKey: DefaultsKey.autoOffService), !legacy.isEmpty {
-      return [legacy]
-    }
-    return nil
-  }
-
-  private func rescheduleAutoOffTimer() {
-    autoOffTimer?.invalidate()
-    autoOffTimer = nil
-
-    guard let deadline = autoOffDeadline() else { return }
-    let interval = deadline.timeIntervalSinceNow
-    if interval <= 0 { return }
-
-    autoOffTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: false) { [weak self] _ in
-      self?.checkAutoOffIfNeeded(reason: "timer")
-    }
-  }
-
-  @objc private func handleWake() {
-    checkAutoOffIfNeeded(reason: "wake")
-  }
-
-  private func checkAutoOffIfNeeded(reason: String) {
-    guard let deadline = autoOffDeadline(), Date() >= deadline else { return }
-    guard let services = autoOffServices(), !services.isEmpty else {
-      setAutoOff(deadline: nil, services: nil)
-      return
-    }
-
-    setAutoOff(deadline: nil, services: nil)
-    runPrivileged(actionName: "Auto-OFF (\(reason))", script: .off, services: services) { _ in [] }
-  }
-
   private enum ScriptKind {
     case on
     case off
@@ -423,87 +568,54 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     let menu = NSMenu()
     menu.delegate = self
 
-    let titleItem = NSMenuItem(title: "splitroute", action: nil, keyEquivalent: "")
+    let active = isRoutingActive()
+    let titleLabel = active ? "splitroute — ON" : "splitroute — OFF"
+    let titleItem = NSMenuItem(title: titleLabel, action: nil, keyEquivalent: "")
     titleItem.isEnabled = false
     menu.addItem(titleItem)
 
-    if let deadline = autoOffDeadline() {
-      let formatter = DateFormatter()
-      formatter.dateStyle = .none
-      formatter.timeStyle = .short
-      let item = NSMenuItem(title: "Auto-OFF: \(formatter.string(from: deadline))", action: nil, keyEquivalent: "")
-      item.isEnabled = false
-      menu.addItem(item)
-
-      let cancel = NSMenuItem(title: "Cancel Auto-OFF", action: #selector(cancelAutoOff), keyEquivalent: "")
-      cancel.target = self
-      menu.addItem(cancel)
-    } else {
-      let item = NSMenuItem(title: "Auto-OFF: (none)", action: nil, keyEquivalent: "")
-      item.isEnabled = false
-      menu.addItem(item)
-    }
-
     menu.addItem(.separator())
 
-    let onNow = NSMenuItem(title: "ON", action: #selector(turnOnNow), keyEquivalent: "o")
-    onNow.target = self
-    menu.addItem(onNow)
+    // ON / OFF
+    if active {
+      let off = NSMenuItem(title: "Turn OFF", action: #selector(turnOff), keyEquivalent: "f")
+      off.target = self
+      menu.addItem(off)
+    } else {
+      let on = NSMenuItem(title: "Turn ON", action: #selector(turnOnNow), keyEquivalent: "o")
+      on.target = self
+      menu.addItem(on)
+    }
 
-    let onFor = NSMenuItem(title: "ON for…", action: nil, keyEquivalent: "")
-    let onForMenu = NSMenu()
-    onForMenu.addItem(makeOnForItem(title: "15 minutes", seconds: 15 * 60))
-    onForMenu.addItem(makeOnForItem(title: "1 hour", seconds: 60 * 60))
-    onForMenu.addItem(makeOnForItem(title: "4 hours", seconds: 4 * 60 * 60))
-    onForMenu.addItem(makeOnForItem(title: "Until end of day", seconds: secondsUntilEndOfDay()))
-    onFor.submenu = onForMenu
-    menu.addItem(onFor)
-
-    let off = NSMenuItem(title: "OFF", action: #selector(turnOff), keyEquivalent: "f")
-    off.target = self
-    menu.addItem(off)
-
-    let refresh = NSMenuItem(title: "REFRESH", action: #selector(refreshNow), keyEquivalent: "r")
+    let refresh = NSMenuItem(title: "Refresh", action: #selector(refreshNow), keyEquivalent: "r")
     refresh.target = self
     menu.addItem(refresh)
 
-    let status = NSMenuItem(title: "STATUS (no curl)", action: #selector(showStatus), keyEquivalent: "s")
-    status.target = self
-    menu.addItem(status)
+    menu.addItem(.separator())
 
-    let verify = NSMenuItem(title: "VERIFY active services (no curl)", action: #selector(verifyActiveServices), keyEquivalent: "")
-    verify.target = self
-    menu.addItem(verify)
+    let check = NSMenuItem(title: "Check connections", action: #selector(checkConnections), keyEquivalent: "s")
+    check.target = self
+    menu.addItem(check)
 
     menu.addItem(.separator())
 
-    let repoItem = NSMenuItem(title: "Set Repo Path…", action: #selector(chooseRepoPath), keyEquivalent: ",")
-    repoItem.target = self
-    menu.addItem(repoItem)
-
+    // Services submenu
     if let paths = getRepoRoot().map({ SplitroutePaths(repoRoot: $0) }) {
       let serviceItem = NSMenuItem(title: "Services", action: nil, keyEquivalent: "")
       serviceItem.submenu = buildServiceMenu(paths: paths)
       menu.addItem(serviceItem)
-
-      let openHosts = NSMenuItem(title: "Open hosts.txt (selected)", action: #selector(openHostsFile), keyEquivalent: "")
-      openHosts.target = self
-      menu.addItem(openHosts)
-
-      let openDns = NSMenuItem(title: "Open dns_domains.txt (selected)", action: #selector(openDnsDomainsFile), keyEquivalent: "")
-      openDns.target = self
-      menu.addItem(openDns)
     }
+
+    // Settings submenu
+    let settingsItem = NSMenuItem(title: "Settings", action: nil, keyEquivalent: "")
+    settingsItem.submenu = buildSettingsMenu()
+    menu.addItem(settingsItem)
+
+    menu.addItem(.separator())
 
     let helpItem = NSMenuItem(title: "Help", action: nil, keyEquivalent: "")
     helpItem.submenu = buildHelpMenu()
     menu.addItem(helpItem)
-
-    let authItem = NSMenuItem(title: "Auth", action: nil, keyEquivalent: "")
-    authItem.submenu = buildAuthMenu()
-    menu.addItem(authItem)
-
-    menu.addItem(.separator())
 
     let quit = NSMenuItem(title: "Quit", action: #selector(quitApp), keyEquivalent: "q")
     quit.target = self
@@ -512,7 +624,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     if isBusy {
       for item in menu.items {
         if item.submenu != nil { continue }
-        if item.action != #selector(quitApp) && item.action != #selector(openHostsFile) && item.action != #selector(openDnsDomainsFile) && item.action != #selector(chooseRepoPath) {
+        if item.action != #selector(quitApp) && item.action != #selector(chooseRepoPath) {
           item.isEnabled = false
         }
       }
@@ -521,18 +633,20 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     statusItem?.menu = menu
   }
 
-  private func makeOnForItem(title: String, seconds: TimeInterval) -> NSMenuItem {
-    let item = NSMenuItem(title: title, action: #selector(turnOnFor), keyEquivalent: "")
-    item.target = self
-    item.representedObject = NSNumber(value: seconds)
-    return item
-  }
+  private func buildSettingsMenu() -> NSMenu {
+    let menu = NSMenu()
 
-  private func secondsUntilEndOfDay() -> TimeInterval {
-    let cal = Calendar.current
-    let now = Date()
-    guard let end = cal.date(bySettingHour: 23, minute: 59, second: 0, of: now) else { return 0 }
-    return max(0, end.timeIntervalSince(now))
+    let authItem = NSMenuItem(title: "Authorization", action: nil, keyEquivalent: "")
+    authItem.submenu = buildAuthMenu()
+    menu.addItem(authItem)
+
+    menu.addItem(.separator())
+
+    let repoItem = NSMenuItem(title: "Set Repo Path…", action: #selector(chooseRepoPath), keyEquivalent: ",")
+    repoItem.target = self
+    menu.addItem(repoItem)
+
+    return menu
   }
 
   private func buildServiceMenu(paths: SplitroutePaths) -> NSMenu {
@@ -568,6 +682,17 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
       item.representedObject = s
       menu.addItem(item)
     }
+
+    menu.addItem(.separator())
+
+    let openHosts = NSMenuItem(title: "Edit hosts.txt…", action: #selector(openHostsFile), keyEquivalent: "")
+    openHosts.target = self
+    menu.addItem(openHosts)
+
+    let openDns = NSMenuItem(title: "Edit dns_domains.txt…", action: #selector(openDnsDomainsFile), keyEquivalent: "")
+    openDns.target = self
+    menu.addItem(openDns)
+
     return menu
   }
 
@@ -607,15 +732,14 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     let menu = NSMenu()
     menu.addItem(helpMenuItem(title: "Quick start", action: #selector(showHelpQuickStart)))
     menu.addItem(.separator())
-    menu.addItem(helpMenuItem(title: "ON - wlacza", action: #selector(showHelpOn)))
-    menu.addItem(helpMenuItem(title: "OFF - wylacza", action: #selector(showHelpOff)))
-    menu.addItem(helpMenuItem(title: "REFRESH - odswieza", action: #selector(showHelpRefresh)))
-    menu.addItem(helpMenuItem(title: "STATUS - sprawdza", action: #selector(showHelpStatus)))
-    menu.addItem(helpMenuItem(title: "VERIFY - szybki test", action: #selector(showHelpVerify)))
+    menu.addItem(helpMenuItem(title: "Turn ON — enables routing", action: #selector(showHelpOn)))
+    menu.addItem(helpMenuItem(title: "Turn OFF — disables routing", action: #selector(showHelpOff)))
+    menu.addItem(helpMenuItem(title: "Refresh — updates IP addresses", action: #selector(showHelpRefresh)))
+    menu.addItem(helpMenuItem(title: "Check — tests connections", action: #selector(showHelpStatus)))
     menu.addItem(.separator())
-    menu.addItem(helpMenuItem(title: "Services - wybor uslug", action: #selector(showHelpServices)))
-    menu.addItem(helpMenuItem(title: "PODSUMOWANIE - co to znaczy", action: #selector(showHelpSummary)))
-    menu.addItem(helpMenuItem(title: "Najczestsze problemy", action: #selector(showHelpTroubleshooting)))
+    menu.addItem(helpMenuItem(title: "Services — selecting services", action: #selector(showHelpServices)))
+    menu.addItem(helpMenuItem(title: "Summary — what results mean", action: #selector(showHelpSummary)))
+    menu.addItem(helpMenuItem(title: "Troubleshooting", action: #selector(showHelpTroubleshooting)))
     return menu
   }
 
@@ -650,17 +774,18 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 
     let alert = NSAlert()
     alert.messageText = "Add Service"
-    alert.informativeText = "Enter a domain like example.com or www.example.com."
+    alert.informativeText = "Enter a domain (e.g. example.com or www.example.com)."
 
     let input = NSTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
     input.placeholderString = "example.com"
     alert.accessoryView = input
-    alert.addButton(withTitle: "Create")
+    alert.addButton(withTitle: "Discover hosts")
+    alert.addButton(withTitle: "Create basic")
     alert.addButton(withTitle: "Cancel")
 
     NSApp.activate(ignoringOtherApps: true)
     let response = alert.runModal()
-    guard response == .alertFirstButtonReturn else { return }
+    guard response != .alertThirdButtonReturn else { return }
 
     guard let baseDomain = normalizeDomainInput(input.stringValue) else {
       showInfo(title: "Invalid domain", text: "Please enter a domain like example.com or www.example.com.")
@@ -681,13 +806,46 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
       return
     }
 
-    do {
-      try createServiceFiles(serviceDir: serviceDir, baseDomain: baseDomain)
-    } catch {
-      showInfo(title: "Create failed", text: "Could not create service files: \(error.localizedDescription)")
-      return
-    }
+    if response == .alertFirstButtonReturn {
+      // Smart Host Discovery (opt-in)
+      let privacyAlert = NSAlert()
+      privacyAlert.messageText = "Host Discovery"
+      privacyAlert.informativeText = "To discover subdomains, the app will:\n\u{2022} Query crt.sh (public certificate transparency log)\n\u{2022} Check ~10 common DNS prefixes (api, www, auth, etc.)\n\nThis sends network requests. Continue?"
+      privacyAlert.addButton(withTitle: "Continue")
+      privacyAlert.addButton(withTitle: "Cancel")
+      guard privacyAlert.runModal() == .alertFirstButtonReturn else { return }
 
+      DispatchQueue.global(qos: .userInitiated).async {
+        self.discoverSubdomains(baseDomain: baseDomain) { subdomains in
+          DispatchQueue.main.async {
+            if subdomains.isEmpty {
+              self.showInfo(title: "No hosts found", text: "Could not discover subdomains. Creating basic service.")
+              do {
+                try self.createServiceFiles(serviceDir: serviceDir, baseDomain: baseDomain)
+              } catch {
+                self.showInfo(title: "Create failed", text: error.localizedDescription)
+                return
+              }
+              self.selectAndEnableService(serviceName, paths: paths)
+            } else {
+              self.showDiscoveryResults(baseDomain: baseDomain, subdomains: subdomains, paths: paths)
+            }
+          }
+        }
+      }
+    } else {
+      // Basic create (no discovery)
+      do {
+        try createServiceFiles(serviceDir: serviceDir, baseDomain: baseDomain)
+      } catch {
+        showInfo(title: "Create failed", text: "Could not create service files: \(error.localizedDescription)")
+        return
+      }
+      selectAndEnableService(serviceName, paths: paths)
+    }
+  }
+
+  private func selectAndEnableService(_ serviceName: String, paths: SplitroutePaths) {
     let services = allServices(paths: paths)
     var selected = Set(selectedServices(paths: paths))
     selected.insert(serviceName)
@@ -705,85 +863,77 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 
   @objc private func showHelpQuickStart() {
     let body = """
-1) Polacz hotspot Wi-Fi i normalny internet.
-2) Wejdz w Services i zaznacz uslugi (lub Add Service).
-3) Kliknij ON.
-4) STATUS/VERIFY pokaze, czy dziala.
-5) Gdy cos nie dziala -> REFRESH.
-6) OFF wylacza i przywraca normalne polaczenie.
+1) Connect your hotspot (Wi-Fi) and main internet (LAN).
+2) Go to Services and select which services to route.
+3) Click Turn ON.
+4) Use Check connections to verify routing.
+5) If something stops working → Refresh.
+6) Turn OFF restores normal routing.
 """
     showHelp(title: "Quick start", body: body)
   }
 
   @objc private func showHelpOn() {
     let body = """
-ON = wlacza.
-- Od tej chwili ruch do tych stron idzie przez hotspot.
-- Wymaga hasla admina (sudo).
+Turn ON enables split-routing.
+- Traffic to selected services goes through your hotspot.
+- Requires admin password (sudo).
 """
-    showHelp(title: "ON", body: body)
+    showHelp(title: "Turn ON", body: body)
   }
 
   @objc private func showHelpOff() {
     let body = """
-OFF = wylacza.
-- Wszystko wraca na normalna trase.
+Turn OFF disables split-routing.
+- All traffic returns to default route.
 """
-    showHelp(title: "OFF", body: body)
+    showHelp(title: "Turn OFF", body: body)
   }
 
   @objc private func showHelpRefresh() {
     let body = """
-REFRESH = odswieza.
-- Uzyj po zmianie sieci lub gdy strona nie dziala.
+Refresh re-resolves all hostnames and updates routes.
+- Use after a network change or when a service stops working.
 """
-    showHelp(title: "REFRESH", body: body)
+    showHelp(title: "Refresh", body: body)
   }
 
   @objc private func showHelpStatus() {
     let body = """
-STATUS = sprawdza.
-- Nic nie zmienia.
-- Pokazuje, czy ruch idzie przez hotspot.
+Check connections verifies routing for each service.
+- Does not change anything.
+- Shows whether traffic goes through hotspot.
 """
-    showHelp(title: "STATUS", body: body)
-  }
-
-  @objc private func showHelpVerify() {
-    let body = """
-VERIFY = szybki test.
-- Sprawdza jedna strone dla kazdej uslugi.
-"""
-    showHelp(title: "VERIFY", body: body)
+    showHelp(title: "Check connections", body: body)
   }
 
   @objc private func showHelpServices() {
     let body = """
-Services = lista uslug.
-- Zaznaczenia sa zapamietywane.
-- Add Service dodaje nowa usluge (domena + www).
-- Gdy cos nie dziala, czasem trzeba dopisac hosty w hosts.txt.
+Services lets you choose which services to route through your hotspot.
+- Selections are remembered between sessions.
+- Add Service creates a new service from a domain name.
+- If something doesn't work, try adding more hosts in hosts.txt.
 """
     showHelp(title: "Services", body: body)
   }
 
   @objc private func showHelpSummary() {
     let body = """
-OK: wszystko dziala.
-UWAGA: dziala, ale cos moze byc ograniczone.
-PROBLEM: cos nie dziala (np. brak hotspotu lub DNS).
+OK: everything works — traffic goes through hotspot.
+WARNING: works, but something may be limited.
+PROBLEM: not working (e.g. hotspot disconnected or DNS issue).
 """
-    showHelp(title: "PODSUMOWANIE", body: body)
+    showHelp(title: "Summary", body: body)
   }
 
   @objc private func showHelpTroubleshooting() {
     let body = """
-Najczestsze problemy i szybkie kroki:
-- Hotspot nieaktywny: polacz z hotspotem, kliknij REFRESH.
-- DNS nie zwraca IP: wlacz DNS override i kliknij REFRESH.
-- Czesc adresow poza hotspotem: dopisz hosty do hosts.txt i kliknij REFRESH.
+Common issues and quick fixes:
+- Hotspot not connected: connect to hotspot, click Refresh.
+- DNS not resolving: enable DNS override and click Refresh.
+- Some addresses not routed: add more hosts to hosts.txt, click Refresh.
 """
-    showHelp(title: "Problemy", body: body)
+    showHelp(title: "Troubleshooting", body: body)
   }
 
   @objc private func chooseRepoPath(_ sender: Any?) {
@@ -837,26 +987,7 @@ Najczestsze problemy i szybkie kroki:
       showInfo(title: "No services selected", text: "Select at least one service to turn ON.")
       return
     }
-    setAutoOff(deadline: nil, services: nil)
     runPrivileged(actionName: "ON", script: .on, services: services) { _ in [] }
-  }
-
-  @objc private func turnOnFor(_ sender: NSMenuItem) {
-    guard let seconds = (sender.representedObject as? NSNumber)?.doubleValue else { return }
-    guard let paths = ensureRepoRootOrPrompt() else { return }
-    let services = selectedServices(paths: paths)
-    guard !services.isEmpty else {
-      showInfo(title: "No services selected", text: "Select at least one service to turn ON.")
-      return
-    }
-    let deadline = Date().addingTimeInterval(seconds)
-    setAutoOff(deadline: deadline, services: services)
-    runPrivileged(actionName: "ON (auto-off)", script: .on, services: services) { _ in [] }
-  }
-
-  @objc private func cancelAutoOff() {
-    setAutoOff(deadline: nil, services: nil)
-    rebuildMenu()
   }
 
   @objc private func turnOff() {
@@ -866,7 +997,6 @@ Najczestsze problemy i szybkie kroki:
       showInfo(title: "No services selected", text: "Select at least one service to turn OFF.")
       return
     }
-    setAutoOff(deadline: nil, services: nil)
     runPrivileged(actionName: "OFF", script: .off, services: services) { _ in [] }
   }
 
@@ -880,21 +1010,11 @@ Najczestsze problemy i szybkie kroki:
     runPrivileged(actionName: "REFRESH", script: .refresh, services: services) { _ in [] }
   }
 
-  @objc private func showStatus() {
+  @objc private func checkConnections() {
     guard let paths = ensureRepoRootOrPrompt() else { return }
     let services = selectedServices(paths: paths)
     guard !services.isEmpty else {
-      showInfo(title: "No services selected", text: "Select at least one service to check status.")
-      return
-    }
-    runPrivileged(actionName: "STATUS", script: .checkNoCurl, services: services) { _ in self.scriptArgs(kind: .checkNoCurl) }
-  }
-
-  @objc private func verifyActiveServices() {
-    guard let paths = ensureRepoRootOrPrompt() else { return }
-    let services = selectedServices(paths: paths)
-    guard !services.isEmpty else {
-      showInfo(title: "No services selected", text: "Select at least one service to verify.")
+      showInfo(title: "No services selected", text: "Select at least one service to check.")
       return
     }
 
@@ -909,7 +1029,7 @@ Najczestsze problemy i szybkie kroki:
     }
 
     guard !targets.isEmpty else {
-      showInfo(title: "VERIFY unavailable", text: "No valid hosts found in dns_domains.txt or hosts.txt for selected services.")
+      showInfo(title: "Check unavailable", text: "No valid hosts found in dns_domains.txt or hosts.txt for selected services.")
       return
     }
 
@@ -919,7 +1039,7 @@ Najczestsze problemy i szybkie kroki:
     }
 
     let ordered = services.filter { targets.keys.contains($0) }
-    runPrivileged(actionName: "VERIFY", script: .checkNoCurl, services: ordered, outputPrefix: prefix) { svc in
+    runPrivileged(actionName: "CHECK", script: .checkNoCurl, services: ordered, outputPrefix: prefix) { svc in
       let host = targets[svc] ?? ""
       return ["--no-curl", "--host", host]
     }
@@ -977,6 +1097,7 @@ Najczestsze problemy i szybkie kroki:
 
       DispatchQueue.main.async {
         self.isBusy = false
+        self.updateStatusIcon()
         self.rebuildMenu()
 
         let title: String
@@ -990,6 +1111,141 @@ Najczestsze problemy i szybkie kroki:
         self.showOutput(title: title, output: attributed)
       }
     }
+  }
+
+  // MARK: - UNUserNotificationCenterDelegate
+
+  func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse, withCompletionHandler completionHandler: @escaping () -> Void) {
+    if response.actionIdentifier == "REFRESH" {
+      DispatchQueue.main.async {
+        self.refreshNow()
+      }
+    }
+    completionHandler()
+  }
+
+  func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification, withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
+    completionHandler([.banner, .sound])
+  }
+
+  // MARK: - Smart Host Discovery
+
+  private func discoverSubdomains(baseDomain: String, completion: @escaping ([String]) -> Void) {
+    let urlString = "https://crt.sh/?q=%25.\(baseDomain)&output=json"
+    guard let url = URL(string: urlString) else {
+      completion([])
+      return
+    }
+
+    var request = URLRequest(url: url, timeoutInterval: 10)
+    request.httpMethod = "GET"
+
+    URLSession.shared.dataTask(with: request) { data, _, error in
+      guard error == nil, let data = data else {
+        completion([])
+        return
+      }
+
+      var subdomains = Set<String>()
+      if let json = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] {
+        for entry in json.prefix(200) {
+          guard let nameValue = entry["name_value"] as? String else { continue }
+          for name in nameValue.split(separator: "\n") {
+            let host = String(name).trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            if host.isEmpty || host.contains("*") { continue }
+            if host == baseDomain || host.hasSuffix(".\(baseDomain)") {
+              subdomains.insert(host)
+            }
+          }
+        }
+      }
+
+      // Also probe common prefixes via DNS
+      let prefixes = ["api", "www", "auth", "cdn", "app", "chat", "login", "static", "docs", "console"]
+      for prefix in prefixes {
+        let candidate = "\(prefix).\(baseDomain)"
+        if subdomains.contains(candidate) { continue }
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/dig")
+        proc.arguments = ["+short", "A", candidate, "+time=1", "+tries=1"]
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = FileHandle.nullDevice
+        do {
+          try proc.run()
+          proc.waitUntilExit()
+        } catch { continue }
+        let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        let ips = out.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !ips.isEmpty && ips.contains(".") {
+          subdomains.insert(candidate)
+        }
+      }
+
+      let sorted = ([baseDomain] + subdomains.filter { $0 != baseDomain }.sorted()).prefix(50)
+      completion(Array(sorted))
+    }.resume()
+  }
+
+  private func showDiscoveryResults(baseDomain: String, subdomains: [String], paths: SplitroutePaths) {
+    let alert = NSAlert()
+    alert.messageText = "Discovered hosts for \(baseDomain)"
+    alert.informativeText = "Select which hosts to include:"
+
+    let scrollView = NSScrollView(frame: NSRect(x: 0, y: 0, width: 400, height: 250))
+    scrollView.hasVerticalScroller = true
+    scrollView.autohidesScrollers = true
+
+    let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 380, height: max(250, subdomains.count * 22 + 10)))
+    var buttons: [NSButton] = []
+    var y = contentView.frame.height - 22
+    for host in subdomains {
+      let btn = NSButton(checkboxWithTitle: host, target: nil, action: nil)
+      btn.state = .on
+      btn.frame = NSRect(x: 5, y: y, width: 370, height: 20)
+      contentView.addSubview(btn)
+      buttons.append(btn)
+      y -= 22
+    }
+    contentView.frame.size.height = CGFloat(subdomains.count * 22 + 10)
+
+    scrollView.documentView = contentView
+    alert.accessoryView = scrollView
+    alert.addButton(withTitle: "Create & Turn ON")
+    alert.addButton(withTitle: "Cancel")
+
+    NSApp.activate(ignoringOtherApps: true)
+    let response = alert.runModal()
+    guard response == .alertFirstButtonReturn else { return }
+
+    let selectedHosts = zip(subdomains, buttons).compactMap { host, btn -> String? in
+      btn.state == .on ? host : nil
+    }
+    guard !selectedHosts.isEmpty else { return }
+
+    let serviceName = baseDomain
+    let serviceDir = paths.servicesDir.appendingPathComponent(serviceName, isDirectory: true)
+
+    do {
+      try FileManager.default.createDirectory(at: serviceDir, withIntermediateDirectories: true)
+
+      let hostsText = (["# discovered"] + selectedHosts).joined(separator: "\n") + "\n"
+      try hostsText.write(to: serviceDir.appendingPathComponent("hosts.txt"), atomically: true, encoding: .utf8)
+
+      let dnsText = "\(baseDomain)\n"
+      try dnsText.write(to: serviceDir.appendingPathComponent("dns_domains.txt"), atomically: true, encoding: .utf8)
+    } catch {
+      showInfo(title: "Create failed", text: "Could not create service files: \(error.localizedDescription)")
+      return
+    }
+
+    let services = allServices(paths: paths)
+    var selected = Set(selectedServices(paths: paths))
+    selected.insert(serviceName)
+    let ordered = services.filter { selected.contains($0) }
+    setSelectedServices(ordered)
+    rebuildMenu()
+    runPrivileged(actionName: "ON", script: .on, services: [serviceName]) { _ in [] }
   }
 
   private func showInfo(title: String, text: String) {

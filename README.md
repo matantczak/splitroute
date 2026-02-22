@@ -1,247 +1,232 @@
 # splitroute (macOS)
 
-Narzędzie do **split‑routingu** na macOS: ustawiasz, że **domyślny ruch** idzie jednym interfejsem (np. Ethernet), a **wybrane usługi** (np. OpenAI/ChatGPT/Codex) są kierowane innym interfejsem (np. iPhone hotspot).
+`splitroute` is a lightweight split-routing tool for macOS.
+You keep normal internet traffic on one interface (for example Ethernet), and route selected services (for example OpenAI/ChatGPT/Codex) through another interface (for example iPhone hotspot).
 
-Projekt jest celowo „lekki”: to zestaw skryptów Bash + pliki konfiguracyjne (listy domen). Nie wymaga VPN ani ciężkich aplikacji.
+This project is intentionally simple: Bash scripts plus service config files. No VPN, no heavy daemon.
 
-## Dokumentacja
+## Documentation
 
-- `docs/case-study-openai.md` — pełny kontekst diagnostyczny (objawy → przyczyna → rozwiązanie)
-- `docs/faq.md` — odpowiedzi na typowe pytania (bezpieczeństwo, „czy tylko OpenAI idzie przez hotspot?”, IP rotacja)
-- `docs/migration.md` — checklist migracji ze starych plików w `~` na to repo (jeśli używałeś „home scripts”)
-- `CONTRIBUTING.md` — jak dodać nową usługę i testować zmiany
-- `SECURITY.md` — informacje bezpieczeństwa i zgłaszanie podatności
-- `DISCLAIMER.md` — uwagi dot. polityk sieci i odpowiedzialności
+- `docs/case-study-openai.md` - real troubleshooting history (symptoms -> root cause -> fix)
+- `docs/faq.md` - practical Q&A
+- `docs/migration.md` - migration from older home-directory scripts
+- `docs/roadmap-watchlist.md` - future ideas
+- `CONTRIBUTING.md` - contribution guide
+- `SECURITY.md` - security policy
+- `DISCLAIMER.md` - policy and liability notes
 
-## Po co to jest
+## What It Does
 
-Typowy przypadek:
-- masz dwa łącza jednocześnie:
-  - `en7` = Ethernet (dock) — szybkie/stabilne, ma być domyślne,
-  - `en0` = Wi‑Fi hotspot (iPhone) — chcesz, żeby **tylko** wybrane usługi szły tędy,
-- chcesz szybko włączać/wyłączać reguły (ON/OFF),
-- chcesz uniknąć proxy/MITM i nie psuć TLS.
+Typical setup:
+- `en7` Ethernet is your default route
+- `en0` hotspot is used only for selected services
 
-## Jak to działa (w skrócie)
+`splitroute` does two things:
 
-`splitroute` robi dwie rzeczy (zależnie od sytuacji):
+1. **Per-host routes (route by IP)**
+- Resolve hostnames from `services/<service>/hosts.txt`
+- Add host routes so those IPs use the hotspot gateway
 
-1) **Per‑host routes (routing po IP)**
-- Skrypt rozwiązuje domeny z `services/<service>/hosts.txt` do listy IP (A/AAAA),
-- Dodaje **host‑route’y** dla tych IP tak, aby system wysyłał ruch do tych IP przez bramę hotspota (`en0`).
-- Dzięki temu nawet jeśli domyślna trasa jest na Ethernecie (`en7`), to ruch do tych konkretnych IP pójdzie przez hotspot.
+2. **Per-domain DNS override (optional but default ON)**
+- Write `/etc/resolver/<domain>` files for domains in `services/<service>/dns_domains.txt`
+- Helps bypass DNS-based blocking (for example `146.112.61.x` blocked-page answers)
 
-2) **Per‑domain DNS override (opcjonalnie)**
-- Jeśli DNS „po drodze” jest blokowany/„podmieniany” (np. Cisco Umbrella/OpenDNS), domeny typu `chatgpt.com` mogą rozwiązywać się do IP strony blokady (często `146.112.61.x`), co kończy się m.in. błędami certyfikatu.
-- W takiej sytuacji `splitroute` może założyć pliki w `/etc/resolver/<domain>` dla wybranych domen (z `services/<service>/dns_domains.txt`), aby te domeny były rozwiązywane przez inne serwery DNS (domyślnie: gateway hotspota, a potem 1.1.1.1/1.0.0.1).
+This is **not** a VPN. It does not tunnel all traffic.
 
-To nie jest VPN: nie tuneluje całego ruchu. Dodaje tylko konkretne wpisy routingu i (opcjonalnie) per‑domenowe resolvery DNS.
+## Security
 
-## Bezpieczeństwo (ważne)
+- No MITM/proxy logic
+- No certificate installation
+- No TLS verification disable
+- HTTPS remains end-to-end encrypted
 
-- **Nie ma MITM/proxy**: projekt nie wstrzykuje certyfikatów, nie zmienia keychain, nie ustawia żadnych proxy systemowych.
-- **TLS pozostaje TLS**: połączenia HTTPS nadal są szyfrowane end‑to‑end do serwera docelowego. Weryfikacja certyfikatu jest po stronie klienta (np. `curl`, przeglądarka, Codex).
-- `splitroute_check.sh` pokazuje `tls_verify=0` wtedy, gdy weryfikacja certyfikatu **się udała** (`ssl_verify_result == 0` w `curl`).
+The tool changes:
+- host routes in the routing table
+- managed resolver files in `/etc/resolver`
 
-Uwaga: jeśli Twoja sieć (Ethernet) sama w sobie robi MITM (np. firmowy proxy z własnym CA), to jest to cecha środowiska sieciowego — `splitroute` tego nie instaluje ani nie wymusza. W praktyce split‑routing może wręcz pomagać omijać takie środowisko dla wybranych usług, kierując je przez hotspot.
+## Requirements
 
-## Wymagania
+- macOS
+- admin permissions (`sudo`) for `route` and `/etc/resolver`
+- standard tools: `route`, `netstat`, `ifconfig`, `ipconfig`, `dscacheutil`, `curl`
+- optional tools: `dig`, `lsof`
 
-- macOS (testowane ad‑hoc na aktualnych wersjach)
-- uprawnienia admina (komendy `route` i `/etc/resolver` wymagają `sudo`)
-- standardowe narzędzia: `route`, `netstat`, `ifconfig`, `ipconfig`, `dscacheutil`, `curl`, opcjonalnie `dig`, `lsof`
+## Project Layout
 
-## Struktura projektu
+- `bin/splitroute` - CLI entrypoint
+- `scripts/splitroute_on.sh` - enable routing for a service
+- `scripts/splitroute_off.sh` - disable routing and clean state
+- `scripts/splitroute_check.sh` - diagnostics
+- `services/<service>/hosts.txt` - hosts (one per line)
+- `services/<service>/dns_domains.txt` - resolver domains (base domains only)
+- `services/_template/` - service template
 
-- `bin/splitroute` — prosta komenda sterująca (on/off/refresh/check)
-- `scripts/splitroute_on.sh` — włącza split‑routing dla usługi
-- `scripts/splitroute_off.sh` — wyłącza i sprząta (routy + resolvery DNS)
-- `scripts/splitroute_check.sh` — diagnostyka: routing, DNS, (opcjonalnie) curl, (opcjonalnie) PID connections
-- `services/<service>/hosts.txt` — lista hostów dla danej usługi (jeden na linię)
-- `services/<service>/dns_domains.txt` — lista domen (nie subdomen!) do `/etc/resolver` (jeden na linię)
-- `services/_template/` — szablon do tworzenia nowej usługi
+Default service: `openai`.
 
-Domyślna usługa: `openai`.
+## Quick Start
 
-## Szybki start (OpenAI/ChatGPT/Codex)
+1. Connect both links:
+   - Ethernet (default route)
+   - hotspot on Wi-Fi
 
-### Instalacja (repo gdziekolwiek)
-
-Umieść repo w dowolnym katalogu (np. przez `git clone`), a potem uruchamiaj polecenia z katalogu repo.
-
-1) Podłącz oba łącza:
-   - Ethernet (np. `en7`) jako domyślne,
-   - hotspot iPhone na Wi‑Fi (zwykle `en0`).
-
-2) Włącz split‑routing dla OpenAI:
+2. Enable split-routing:
 ```bash
 cd /path/to/splitroute
 ./bin/splitroute on openai
 ```
 
-3) Sprawdź, czy OpenAI idzie przez hotspot, a „kontrolny” host idzie trasą domyślną:
+3. Verify routing:
 ```bash
 ./bin/splitroute check openai -- --host chatgpt.com --control
 ```
 
-4) Jeśli coś przestaje działać (zmiana IP przez CDN/load‑balancing) — odśwież:
+4. Refresh if needed:
 ```bash
 ./bin/splitroute refresh openai
 ```
 
-5) Wyłącz i wróć do normalnego zachowania macOS:
+5. Turn it off:
 ```bash
 ./bin/splitroute off openai
 ```
 
-## Konfiguracja
+## Configuration
 
-### Interfejsy
+### Interfaces
 
-Domyślnie:
+Defaults:
 - `WIFI_IF=en0`
 - `ETH_IF=en7`
 
-Jeśli masz inne nazwy:
+Override example:
 ```bash
 WIFI_IF=en0 ETH_IF=en7 ./bin/splitroute check openai -- --control
 ```
 
-### Lista hostów usługi
+### Host list
 
-Edytuj: `services/openai/hosts.txt`
+Edit:
+- `services/openai/hosts.txt`
 
-Możesz dopisywać hosty, z których realnie korzysta klient (np. `api.openai.com`, `auth.openai.com`, `oaistatic.com`, `oaiusercontent.com`).
+### DNS override
 
-### DNS override (/etc/resolver)
+Modes:
+- `DNS_OVERRIDE=on` - always use per-domain resolvers
+- `DNS_OVERRIDE=auto` - enable only when blocked DNS is detected
+- `DNS_OVERRIDE=off` - never write `/etc/resolver`
 
-Skrypty mają tryb:
-- `DNS_OVERRIDE=on` — zawsze włącz override
-- `DNS_OVERRIDE=auto` — włącza override, jeśli wykryje typowy „blocked page” IP (`146.112.61.x`) dla hostów z listy usługi
-- `DNS_OVERRIDE=off` — nigdy nie ruszaj `/etc/resolver`
+Default:
+- `DNS_OVERRIDE=on`
 
-Domyślnie:
-- `DNS_OVERRIDE=on` dla wszystkich usług (żeby nie „wracała” blokada DNS po zmianie sieci).
-
-Jeśli chcesz nadpisać domyślne zachowanie bez podawania `DNS_OVERRIDE` za każdym razem, użyj:
-- `DNS_OVERRIDE_DEFAULT=auto` / `DNS_OVERRIDE_DEFAULT=off`
-
-Serwery DNS (fallback) ustawisz np.:
+Examples:
 ```bash
 DNS_OVERRIDE=on DNS_SERVERS="1.1.1.1 8.8.8.8" ./bin/splitroute on openai
 ```
 
-Domeny, dla których tworzone są pliki w `/etc/resolver`, są w:
+Domain source:
 - `services/openai/dns_domains.txt`
 
-Ważne: celowo **nie** dodajemy tu `cloudflare.com`, żeby nie zmieniać DNS dla ogromnej liczby niepowiązanych usług.
+## Diagnostics
 
-## Diagnostyka i testy
-
-### 1) Status routingu dla hostów usługi
+Routing check:
 ```bash
 ./bin/splitroute check openai -- --no-curl
 ```
 
-### 2) Test kontrolny „czy reszta internetu idzie domyślnie”
+Control host check:
 ```bash
 ./bin/splitroute control openai -- --control-host youtube.com --no-curl
 ```
 
-### 3) Sprawdzenie ruchu konkretnego procesu (np. Codex)
-1) Uruchom Codex w osobnym terminalu.
-2) Znajdź PID (przykład):
+PID-based check:
 ```bash
 pgrep -n codex
-```
-3) Sprawdź połączenia procesu:
-```bash
 ./bin/splitroute check openai -- --pid <PID> --no-curl
 ```
 
-### 4) Typowy objaw problemu z DNS (Umbrella/OpenDNS)
+## Persistence and Cleanup
 
-Jeśli widzisz w rozwiązywaniu DNS IP typu `146.112.61.x` albo `curl`/przeglądarka krzyczy o certyfikaty, to zwykle **nie routing**, tylko **DNS podmieniony na stronę blokady**.
+- Host routes are runtime-only and disappear after reboot.
+- Resolver files in `/etc/resolver` are on-disk and can persist until cleaned.
+- `./bin/splitroute off <service>` removes both routes and managed resolver files.
+- `splitroute_off.sh` has fallback cleanup even when `/tmp` state files are gone.
 
-Wtedy:
-- włącz `DNS_OVERRIDE=on` i uruchom `on`/`refresh`,
-- zweryfikuj, że `dig +short @1.1.1.1 chatgpt.com` zwraca IP inne niż `146.112.61.x`.
+Menu bar app behavior:
+- Auto-OFF is intentionally removed.
+- ON/OFF are manual only.
+- At app launch, stale splitroute state from a previous session is detected and reset (requires admin auth).
+- Service host files are never auto-deleted. They stay in `services/<service>/` until you remove them manually.
 
-## „Bez śladów” i zachowanie po restarcie
+To guarantee reset after reboot/login, add the app to macOS Login Items so startup cleanup runs automatically.
 
-- Host‑route’y dodane przez `route add ...` są w pamięci i **znikają po restarcie**.
-- Pliki `/etc/resolver/*` są na dysku, więc jeśli zrestartujesz komputer w trybie ON (bez `off`), to te pliki mogą zostać i dalej wpływać na DNS dla tych domen.
+## Limitations
 
-Co robimy w tej wersji:
-- `splitroute off` usuwa zarówno routy, jak i pliki `/etc/resolver` stworzone przez narzędzie,
-- `splitroute_off.sh` ma fallback: jeśli `/tmp` zniknęło po restarcie, i tak usuwa wszystkie pliki z markerem `splitroute_managed:<service>`.
+1. Routing is by IP, not by domain.
+2. CDN IPs can rotate; use `refresh` when needed.
+3. IPv6 may be unavailable on hotspot.
+4. If hotspot disconnects while ON, service traffic can fail until `off` or `refresh`.
 
-Plany na przyszłość (świadomie **nie** w tej wersji):
-- LaunchDaemon/helper, który przy starcie systemu sprząta `/etc/resolver`, jeśli tryb nie jest aktywny (czyli „zawsze czysto po restarcie” bez ręcznego `off`).
+## Roadmap
 
-## Ograniczenia (ważne, żeby rozumieć)
+- Better service editor UX
+- Optional blocked-service watchlist
+- Optional helper/daemon model for stricter lifecycle cleanup
 
-1) Routing jest **po IP**, a nie „po domenie”.
-   - Jeśli CDN współdzieli IP między różnymi usługami, bardzo rzadko może to spowodować, że jakiś niepowiązany ruch do tego samego IP też pójdzie przez hotspot.
+## Menu Bar App (local build)
 
-2) IP usług mogą się zmieniać (CDN/load‑balancing).
-   - Jeśli w trakcie sesji pojawią się nowe IP, których nie ma w trasach, część nowych połączeń może wrócić na domyślną trasę.
-   - Rozwiązanie w tej wersji: `splitroute refresh`.
-
-3) IPv6:
-   - Hotspot iPhone często nie daje IPv6 routingu; wtedy AAAA może wskazywać IP, do którego nie da się sensownie dodać trasy przez `en0`.
-   - Skrypty dodają IPv6 host‑route’y tylko jeśli wykryją IPv6 gateway na `WIFI_IF`.
-
-4) Hotspot rozłączy się w trybie ON:
-   - host‑route’y mogą dalej wskazywać bramę hotspota, która nie istnieje → część połączeń do usługi może przestać działać,
-   - w tej wersji trzeba ręcznie wykonać `splitroute off` (lub ponownie podłączyć hotspot i zrobić `refresh`).
-
-## Roadmap (kierunek rozwoju)
-
-- prosta aplikacja menu‑bar (SwiftUI) z przyciskami: ON/OFF/REFRESH/STATUS
-- edytor usług (dodawanie folderów w `services/`)
-- opcjonalny tryb „auto‑refresh” (np. co 15 min lub przy zmianie sieci)
-- tryb „always clean after reboot” (LaunchDaemon/helper)
-
-## Menu‑bar app (lokalnie)
-
-W repo jest prosta aplikacja menu‑bar `SplitrouteMenuBar` (AppKit), która steruje skryptami `splitroute` z górnego paska macOS.
-
-Build + uruchomienie:
+Build and run:
 ```bash
 bash scripts/build_menubar_app.sh
 open build/SplitrouteMenuBar.app
 ```
 
-Workflow (po zmianach: build + install + uruchom + paczka):
+Workflow:
 ```bash
 bash scripts/workflow_menubar_app.sh
-# lub (jesli chcesz instalowac do /Applications)
+# or install to /Applications
 sudo bash scripts/workflow_menubar_app.sh
 ```
 
-Pakowanie do DMG (instalacja przez przeciagniecie do Applications):
+Package:
 ```bash
 bash scripts/package_menubar_app.sh
 open build/SplitrouteMenuBar.dmg
 ```
-Jeśli DMG nie da sie zrobic, skrypt stworzy `build/SplitrouteMenuBar.zip` (instalacja: rozpakuj i przeciagnij appke do Applications).
 
-Uwagi:
-- Jeśli appka nie wykryje automatycznie repo, użyj `Set Repo Path…`.
-- `Services` pozwala zaznaczyć wiele usług naraz; `ON/OFF/REFRESH/STATUS/VERIFY` działają na zaznaczone.
-- `Services -> Add Service…` tworzy nową usługę na podstawie domeny i od razu ją włącza.
-- `Auth -> Touch ID (sudo)` działa, gdy Touch ID jest włączone dla `sudo` (w `/etc/pam.d/sudo` jest `pam_tid.so`). W przeciwnym razie wybierz `Password prompt (system dialog)`.
-- Auto‑OFF po uśpieniu wykona się po wybudzeniu (może poprosić o autoryzację).
-- Po przełączeniu `ON/OFF` przeglądarka może trzymać istniejące połączenia — do testów zrób pełne wyjście (`Cmd+Q`) albo użyj `STATUS/VERIFY`.
-- Żeby mieć ją „jak normalną appkę”: skopiuj do `~/Applications/` albo zainstaluj do `/Applications/` przez `bash scripts/install_menubar_app.sh` (może wymagać `sudo`), a potem dodaj do Login Items.
+If DMG creation fails, the script creates `build/SplitrouteMenuBar.zip`.
 
-## Publikacja na GitHub
+## Release Workflow
 
-Przed publikacją warto:
-- zweryfikować `LICENSE` (np. jeśli chcesz inną licencję niż MIT),
-- dopisać informacje o wersji macOS i znanych ograniczeniach sieci (firmowe DNS, proxy).
+1. Build/install/package:
+```bash
+sudo bash scripts/workflow_menubar_app.sh
+```
 
-## License
+2. Commit and tag:
+```bash
+git commit -am "release: v0.x"
+git tag -a v0.x -m "v0.x"
+```
 
-MIT — see `LICENSE`.
+3. Push:
+```bash
+git push origin master --tags
+```
+
+4. Create release:
+```bash
+gh release create v0.x build/SplitrouteMenuBar.dmg -t "v0.x" -n "Release v0.x"
+```
+
+If DMG is missing:
+```bash
+gh release create v0.x build/SplitrouteMenuBar.zip -t "v0.x" -n "Release v0.x"
+```
+
+## Notes
+
+- If repo auto-detection fails, use `Settings -> Set Repo Path...`.
+- `Services` supports multi-select.
+- `Check connections` verifies route behavior without changing config.
+- `Add Service...` can create a basic service or run Smart Host Discovery (explicit opt-in).
+- `Touch ID (sudo)` requires `pam_tid.so` in `/etc/pam.d/sudo`.
