@@ -8,6 +8,7 @@ private enum DefaultsKey {
   static let selectedService = "SplitrouteSelectedService" // legacy
   static let selectedServices = "SplitrouteSelectedServices"
   static let authMode = "SplitrouteAuthMode"
+  static let autoRefresh = "SplitrouteAutoRefresh"
 }
 
 private enum AuthMode: String {
@@ -22,12 +23,20 @@ private struct CommandResult {
 
 private final class OutputPopoverViewController: NSViewController {
   private let titleText: String
-  private let attributedText: NSAttributedString
+  private let summaryText: NSAttributedString
+  private let detailsText: NSAttributedString?
   private let onClose: () -> Void
+  private var detailsScrollView: NSScrollView?
+  private var disclosureButton: NSButton?
+  private var detailsVisible = false
+  private var stack: NSStackView?
+  private let collapsedSize = NSSize(width: 560, height: 320)
+  private let expandedSize = NSSize(width: 620, height: 520)
 
-  init(title: String, text: NSAttributedString, onClose: @escaping () -> Void) {
+  init(title: String, summary: NSAttributedString, details: NSAttributedString? = nil, onClose: @escaping () -> Void) {
     self.titleText = title
-    self.attributedText = text
+    self.summaryText = summary
+    self.detailsText = details
     self.onClose = onClose
     super.init(nibName: nil, bundle: nil)
   }
@@ -43,28 +52,66 @@ private final class OutputPopoverViewController: NSViewController {
     titleLabel.textColor = .labelColor
     titleLabel.lineBreakMode = .byTruncatingTail
 
-    let textView = NSTextView()
-    textView.isEditable = false
-    textView.isSelectable = true
-    textView.isRichText = true
-    textView.textColor = .labelColor
-    textView.backgroundColor = .textBackgroundColor
-    textView.textStorage?.setAttributedString(attributedText)
-    textView.minSize = .init(width: 0, height: 0)
-    textView.maxSize = .init(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
-    textView.isVerticallyResizable = true
-    textView.isHorizontallyResizable = false
-    textView.autoresizingMask = [.width]
-    textView.textContainerInset = .init(width: 8, height: 8)
-    textView.textContainer?.containerSize = .init(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
-    textView.textContainer?.widthTracksTextView = true
+    // Summary (always visible)
+    let summaryView = NSTextView()
+    summaryView.isEditable = false
+    summaryView.isSelectable = true
+    summaryView.isRichText = true
+    summaryView.textColor = .labelColor
+    summaryView.backgroundColor = .clear
+    summaryView.drawsBackground = false
+    summaryView.textStorage?.setAttributedString(summaryText)
+    summaryView.isVerticallyResizable = true
+    summaryView.isHorizontallyResizable = false
+    summaryView.autoresizingMask = [.width]
+    summaryView.textContainerInset = .init(width: 4, height: 4)
+    summaryView.textContainer?.widthTracksTextView = true
 
-    let scrollView = NSScrollView()
-    scrollView.borderType = .bezelBorder
-    scrollView.hasVerticalScroller = true
-    scrollView.hasHorizontalScroller = false
-    scrollView.autohidesScrollers = true
-    scrollView.documentView = textView
+    let summaryScroll = NSScrollView()
+    summaryScroll.borderType = .noBorder
+    summaryScroll.hasVerticalScroller = true
+    summaryScroll.autohidesScrollers = true
+    summaryScroll.documentView = summaryView
+
+    var stackViews: [NSView] = [titleLabel, summaryScroll]
+
+    // Details (collapsible)
+    if let detailsText = detailsText {
+      let detailsTextView = NSTextView()
+      detailsTextView.isEditable = false
+      detailsTextView.isSelectable = true
+      detailsTextView.isRichText = true
+      detailsTextView.textColor = .labelColor
+      detailsTextView.backgroundColor = .textBackgroundColor
+      detailsTextView.textStorage?.setAttributedString(detailsText)
+      detailsTextView.minSize = .init(width: 0, height: 0)
+      detailsTextView.maxSize = .init(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
+      detailsTextView.isVerticallyResizable = true
+      detailsTextView.isHorizontallyResizable = false
+      detailsTextView.autoresizingMask = [.width]
+      detailsTextView.textContainerInset = .init(width: 8, height: 8)
+      detailsTextView.textContainer?.containerSize = .init(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
+      detailsTextView.textContainer?.widthTracksTextView = true
+
+      let detailsScroll = NSScrollView()
+      detailsScroll.borderType = .bezelBorder
+      detailsScroll.hasVerticalScroller = true
+      detailsScroll.hasHorizontalScroller = false
+      detailsScroll.autohidesScrollers = true
+      detailsScroll.documentView = detailsTextView
+      detailsScroll.isHidden = true
+      self.detailsScrollView = detailsScroll
+
+      let discBtn = NSButton(title: "Show details ▸", target: self, action: #selector(toggleDetails))
+      discBtn.bezelStyle = .inline
+      discBtn.isBordered = false
+      discBtn.font = NSFont.systemFont(ofSize: NSFont.smallSystemFontSize)
+      discBtn.contentTintColor = .secondaryLabelColor
+      self.disclosureButton = discBtn
+
+      stackViews.append(discBtn)
+      stackViews.append(detailsScroll)
+    }
 
     let okButton = NSButton(title: "OK", target: self, action: #selector(closeAction))
     okButton.bezelStyle = .rounded
@@ -75,23 +122,34 @@ private final class OutputPopoverViewController: NSViewController {
     buttonRow.alignment = .centerY
     buttonRow.distribution = .fill
 
-    let stack = NSStackView(views: [titleLabel, scrollView, buttonRow])
-    stack.orientation = .vertical
-    stack.spacing = 10
-    stack.edgeInsets = NSEdgeInsets(top: 12, left: 12, bottom: 12, right: 12)
+    stackViews.append(buttonRow)
+
+    let mainStack = NSStackView(views: stackViews)
+    mainStack.orientation = .vertical
+    mainStack.spacing = 8
+    mainStack.edgeInsets = NSEdgeInsets(top: 12, left: 12, bottom: 12, right: 12)
+    mainStack.alignment = .leading
+    self.stack = mainStack
 
     let container = NSView()
-    container.addSubview(stack)
-    stack.translatesAutoresizingMaskIntoConstraints = false
+    container.addSubview(mainStack)
+    mainStack.translatesAutoresizingMaskIntoConstraints = false
     NSLayoutConstraint.activate([
-      stack.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-      stack.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-      stack.topAnchor.constraint(equalTo: container.topAnchor),
-      stack.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+      mainStack.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+      mainStack.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+      mainStack.topAnchor.constraint(equalTo: container.topAnchor),
+      mainStack.bottomAnchor.constraint(equalTo: container.bottomAnchor),
     ])
 
     view = container
-    preferredContentSize = NSSize(width: 620, height: 440)
+    preferredContentSize = detailsText != nil ? collapsedSize : NSSize(width: 520, height: 260)
+  }
+
+  @objc private func toggleDetails() {
+    detailsVisible.toggle()
+    detailsScrollView?.isHidden = !detailsVisible
+    disclosureButton?.title = detailsVisible ? "Hide details ▾" : "Show details ▸"
+    preferredContentSize = detailsVisible ? expandedSize : collapsedSize
   }
 
   @objc private func closeAction() {
@@ -235,6 +293,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
   private var pathMonitor: NWPathMonitor?
   private var lastPathDescription = ""
   private var networkDebounceWork: DispatchWorkItem?
+  private var lastCheckDate: Date?
+  private var lastCheckInfo: String?
 
   func applicationDidFinishLaunching(_ notification: Notification) {
     NSApp.setActivationPolicy(.accessory)
@@ -347,9 +407,17 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
   }
 
   private func isHotspotReachable() -> Bool {
+    return isInterfaceGatewayPresent("en0")
+  }
+
+  private func isEthernetReachable() -> Bool {
+    return isInterfaceGatewayPresent("en7")
+  }
+
+  private func isInterfaceGatewayPresent(_ iface: String) -> Bool {
     let proc = Process()
     proc.executableURL = URL(fileURLWithPath: "/usr/sbin/ipconfig")
-    proc.arguments = ["getoption", "en0", "router"]
+    proc.arguments = ["getoption", iface, "router"]
     let pipe = Pipe()
     proc.standardOutput = pipe
     proc.standardError = FileHandle.nullDevice
@@ -385,31 +453,70 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     return false
   }
 
+  private func activeServiceNames() -> [String] {
+    let fromRoutes = servicesFromStateFiles(suffix: "_routes.txt")
+    let fromResolvers = servicesFromManagedResolvers()
+    return Array(Set(fromRoutes + fromResolvers)).sorted()
+  }
+
   private func updateStatusIcon() {
     guard let button = statusItem?.button else { return }
-    let active = isRoutingActive()
 
-    if !active {
-      button.image = NSImage(systemSymbolName: "arrow.triangle.branch", accessibilityDescription: "splitroute — OFF")
-      button.image?.isTemplate = true
-      button.toolTip = "splitroute — OFF"
+    if isBusy {
+      let img = NSImage(systemSymbolName: "arrow.triangle.2.circlepath", accessibilityDescription: "splitroute \u{2014} working")
+      let config = NSImage.SymbolConfiguration(paletteColors: [.systemBlue])
+      button.image = img?.withSymbolConfiguration(config)
+      button.image?.isTemplate = false
+      button.toolTip = "splitroute \u{2014} working\u{2026}"
       return
     }
 
-    let hotspot = isHotspotReachable()
-    if hotspot {
-      let img = NSImage(systemSymbolName: "arrow.triangle.branch", accessibilityDescription: "splitroute — ON")
+    let active = isRoutingActive()
+    let wifi = isHotspotReachable()
+    let ethernet = isEthernetReachable()
+
+    if !active {
+      button.image = NSImage(systemSymbolName: "arrow.triangle.branch", accessibilityDescription: "splitroute \u{2014} OFF")
+      button.image?.isTemplate = true
+      var tip = "splitroute \u{2014} OFF"
+      tip += "\nEthernet (en7): \(ethernet ? "connected" : "disconnected")"
+      tip += "\nWi-Fi (en0): \(wifi ? "connected" : "disconnected")"
+      if !wifi {
+        tip += "\n\u{274c} No Wi-Fi \u{2014} connect iPhone hotspot to use splitroute"
+      } else if !ethernet {
+        tip += "\n\u{26a0}\u{fe0f} No Ethernet \u{2014} splitroute needs both connections"
+      } else {
+        tip += "\n\u{2705} Ready to route"
+      }
+      button.toolTip = tip
+      return
+    }
+
+    let services = activeServiceNames()
+    var tip = "splitroute \u{2014} ON"
+    tip += "\nEthernet (en7): \(ethernet ? "connected" : "disconnected")"
+    tip += "\nWi-Fi (en0): \(wifi ? "connected" : "disconnected")"
+    if !services.isEmpty {
+      tip += "\nActive: \(services.joined(separator: ", "))"
+    }
+    if !wifi {
+      tip += "\n\u{274c} Wi-Fi disconnected \u{2014} routing may not work"
+    } else if !ethernet {
+      tip += "\n\u{26a0}\u{fe0f} No Ethernet \u{2014} all traffic goes through Wi-Fi"
+    }
+
+    if wifi {
+      let img = NSImage(systemSymbolName: "arrow.triangle.branch", accessibilityDescription: "splitroute \u{2014} ON")
       let config = NSImage.SymbolConfiguration(paletteColors: [.systemGreen])
       button.image = img?.withSymbolConfiguration(config)
       button.image?.isTemplate = false
-      button.toolTip = "splitroute — ON"
     } else {
-      let img = NSImage(systemSymbolName: "exclamationmark.triangle", accessibilityDescription: "splitroute — no hotspot")
+      let img = NSImage(systemSymbolName: "exclamationmark.triangle", accessibilityDescription: "splitroute \u{2014} no Wi-Fi")
       let config = NSImage.SymbolConfiguration(paletteColors: [.systemYellow])
       button.image = img?.withSymbolConfiguration(config)
       button.image?.isTemplate = false
-      button.toolTip = "splitroute — ON (no hotspot)"
     }
+    button.toolTip = tip
   }
 
   // MARK: - Network monitor (event-driven, no polling)
@@ -437,10 +544,15 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     guard !wasFirst else { return }
     guard isRoutingActive() else { return }
 
-    // Debounce: wait 5s before showing notification
+    // Debounce: wait 5s before acting
     networkDebounceWork?.cancel()
     let work = DispatchWorkItem { [weak self] in
-      self?.showNetworkChangeNotification()
+      guard let self else { return }
+      if self.defaults().bool(forKey: DefaultsKey.autoRefresh) {
+        self.refreshNow()
+      } else {
+        self.showNetworkChangeNotification()
+      }
     }
     networkDebounceWork = work
     DispatchQueue.main.asyncAfter(deadline: .now() + 5, execute: work)
@@ -569,12 +681,58 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     menu.delegate = self
 
     let active = isRoutingActive()
-    let titleLabel = active ? "splitroute — ON" : "splitroute — OFF"
+    let wifi = isHotspotReachable()
+    let ethernet = isEthernetReachable()
+
+    // Status header
+    let titleLabel = active ? "splitroute \u{2014} ON" : "splitroute \u{2014} OFF"
     let titleItem = NSMenuItem(title: titleLabel, action: nil, keyEquivalent: "")
     titleItem.isEnabled = false
     menu.addItem(titleItem)
 
+    let ethLabel = "  Ethernet (en7): \(ethernet ? "connected" : "disconnected")"
+    let ethItem = NSMenuItem(title: ethLabel, action: nil, keyEquivalent: "")
+    ethItem.isEnabled = false
+    menu.addItem(ethItem)
+
+    let wifiLabel = "  Wi-Fi (en0): \(wifi ? "connected" : "disconnected")"
+    let wifiItem = NSMenuItem(title: wifiLabel, action: nil, keyEquivalent: "")
+    wifiItem.isEnabled = false
+    menu.addItem(wifiItem)
+
+    // Readiness hint
+    let readinessLabel: String
+    if !wifi {
+      readinessLabel = "  \u{274c} Connect iPhone hotspot to use splitroute"
+    } else if !ethernet {
+      readinessLabel = active
+        ? "  \u{26a0}\u{fe0f} No Ethernet \u{2014} all traffic goes through Wi-Fi"
+        : "  \u{26a0}\u{fe0f} Wi-Fi only \u{2014} connect Ethernet for split routing"
+    } else {
+      readinessLabel = active ? "  \u{2705} Routing active" : "  \u{2705} Ready to route"
+    }
+    let readinessItem = NSMenuItem(title: readinessLabel, action: nil, keyEquivalent: "")
+    readinessItem.isEnabled = false
+    menu.addItem(readinessItem)
+
+    if active {
+      let services = activeServiceNames()
+      if !services.isEmpty {
+        let svcLabel = "  Active: \(services.joined(separator: ", "))"
+        let svcItem = NSMenuItem(title: svcLabel, action: nil, keyEquivalent: "")
+        svcItem.isEnabled = false
+        menu.addItem(svcItem)
+      }
+    }
+
     menu.addItem(.separator())
+
+    if isBusy {
+      let busyItem = NSMenuItem(title: "⏳ Working…", action: nil, keyEquivalent: "")
+      busyItem.isEnabled = false
+      menu.addItem(busyItem)
+      menu.addItem(.separator())
+    }
 
     // ON / OFF
     if active {
@@ -596,6 +754,15 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     let check = NSMenuItem(title: "Check connections", action: #selector(checkConnections), keyEquivalent: "s")
     check.target = self
     menu.addItem(check)
+
+    if let lastDate = lastCheckDate, let lastInfo = lastCheckInfo {
+      let formatter = DateFormatter()
+      formatter.dateFormat = "HH:mm"
+      let timeStr = formatter.string(from: lastDate)
+      let lastItem = NSMenuItem(title: "  Last: \(timeStr) \u{2014} \(lastInfo)", action: nil, keyEquivalent: "")
+      lastItem.isEnabled = false
+      menu.addItem(lastItem)
+    }
 
     menu.addItem(.separator())
 
@@ -642,6 +809,14 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 
     menu.addItem(.separator())
 
+    let autoRefreshOn = defaults().bool(forKey: DefaultsKey.autoRefresh)
+    let autoRefreshItem = NSMenuItem(title: "Auto-refresh on network change", action: #selector(toggleAutoRefresh), keyEquivalent: "")
+    autoRefreshItem.target = self
+    autoRefreshItem.state = autoRefreshOn ? .on : .off
+    menu.addItem(autoRefreshItem)
+
+    menu.addItem(.separator())
+
     let repoItem = NSMenuItem(title: "Set Repo Path…", action: #selector(chooseRepoPath), keyEquivalent: ",")
     repoItem.target = self
     menu.addItem(repoItem)
@@ -675,8 +850,14 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
       return menu
     }
 
+    let activeSet = Set(activeServiceNames())
     for s in services {
-      let item = NSMenuItem(title: s, action: #selector(toggleService(_:)), keyEquivalent: "")
+      let isRouted = activeSet.contains(s)
+      let hostsFile = paths.servicesDir.appendingPathComponent("\(s)/hosts.txt")
+      let hostCount = countHostLines(from: hostsFile)
+      let statusLabel = isRouted ? "routed" : "off"
+      let title = "\(s)  \u{2014}  \(statusLabel) (\(hostCount) hosts)"
+      let item = NSMenuItem(title: title, action: #selector(toggleService(_:)), keyEquivalent: "")
       item.target = self
       item.state = selected.contains(s) ? .on : .off
       item.representedObject = s
@@ -861,6 +1042,12 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     rebuildMenu()
   }
 
+  @objc private func toggleAutoRefresh() {
+    let current = defaults().bool(forKey: DefaultsKey.autoRefresh)
+    defaults().set(!current, forKey: DefaultsKey.autoRefresh)
+    rebuildMenu()
+  }
+
   @objc private func showHelpQuickStart() {
     let body = """
 1) Connect your hotspot (Wi-Fi) and main internet (LAN).
@@ -987,31 +1174,66 @@ Common issues and quick fixes:
       showInfo(title: "No services selected", text: "Select at least one service to turn ON.")
       return
     }
+    if !isHotspotReachable() {
+      let alert = NSAlert()
+      alert.messageText = "No Wi-Fi connection"
+      alert.informativeText = "Wi-Fi (en0) is not connected. Splitroute needs an iPhone hotspot on Wi-Fi to route traffic.\n\nContinue anyway?"
+      alert.alertStyle = .warning
+      alert.addButton(withTitle: "Turn ON anyway")
+      alert.addButton(withTitle: "Cancel")
+      if alert.runModal() != .alertFirstButtonReturn { return }
+    }
     runPrivileged(actionName: "ON", script: .on, services: services) { _ in [] }
   }
 
   @objc private func turnOff() {
     guard let paths = ensureRepoRootOrPrompt() else { return }
-    let services = selectedServices(paths: paths)
-    guard !services.isEmpty else {
-      showInfo(title: "No services selected", text: "Select at least one service to turn OFF.")
-      return
+    var services = selectedServices(paths: paths)
+    if services.isEmpty {
+      // Fallback: turn off whatever is actually active (fixes UX trap when "Select none" was used)
+      services = activeServiceNames()
     }
+    guard !services.isEmpty else { return }
     runPrivileged(actionName: "OFF", script: .off, services: services) { _ in [] }
   }
 
   @objc private func refreshNow() {
     guard let paths = ensureRepoRootOrPrompt() else { return }
-    let services = selectedServices(paths: paths)
-    guard !services.isEmpty else {
-      showInfo(title: "No services selected", text: "Select at least one service to refresh.")
-      return
+    var services = selectedServices(paths: paths)
+    if services.isEmpty {
+      services = activeServiceNames()
+    }
+    guard !services.isEmpty else { return }
+    if !isHotspotReachable() {
+      let alert = NSAlert()
+      alert.messageText = "No Wi-Fi connection"
+      alert.informativeText = "Wi-Fi (en0) is not connected. Refresh needs a hotspot to update routes.\n\nContinue anyway?"
+      alert.alertStyle = .warning
+      alert.addButton(withTitle: "Refresh anyway")
+      alert.addButton(withTitle: "Cancel")
+      if alert.runModal() != .alertFirstButtonReturn { return }
     }
     runPrivileged(actionName: "REFRESH", script: .refresh, services: services) { _ in [] }
   }
 
   @objc private func checkConnections() {
     guard let paths = ensureRepoRootOrPrompt() else { return }
+
+    if !isRoutingActive() {
+      showInfo(title: "Routing is OFF", text: "Turn ON routing first, then check connections.")
+      return
+    }
+
+    if !isHotspotReachable() {
+      let alert = NSAlert()
+      alert.messageText = "No Wi-Fi connection"
+      alert.informativeText = "Wi-Fi (en0) is not connected. Check results may not be meaningful."
+      alert.alertStyle = .warning
+      alert.addButton(withTitle: "Check anyway")
+      alert.addButton(withTitle: "Cancel")
+      if alert.runModal() != .alertFirstButtonReturn { return }
+    }
+
     let services = selectedServices(paths: paths)
     guard !services.isEmpty else {
       showInfo(title: "No services selected", text: "Select at least one service to check.")
@@ -1107,8 +1329,36 @@ Common issues and quick fixes:
           title = "\(actionName) — \(ordered.count) services"
         }
         let output = combined.isEmpty ? "(no output)" : combined
-        let attributed = self.formatOutput(summaries: summaries, details: output)
-        self.showOutput(title: title, output: attributed)
+        let networkCtx = self.networkContextString()
+        let summary = self.formatSummary(summaries: summaries, networkContext: networkCtx)
+        let details = self.formatDetails(output)
+
+        // Store last check info (use worst level across all services)
+        if script == .checkNoCurl, !summaries.isEmpty {
+          self.lastCheckDate = Date()
+          let worstLevel: SummaryLevel
+          if summaries.contains(where: { $0.level == .error }) {
+            worstLevel = .error
+          } else if summaries.contains(where: { $0.level == .warn }) {
+            worstLevel = .warn
+          } else {
+            worstLevel = .ok
+          }
+          let icon: String
+          switch worstLevel {
+          case .ok: icon = "\u{2705}"
+          case .warn: icon = "\u{26a0}\u{fe0f}"
+          case .error: icon = "\u{274c}"
+          }
+          if summaries.count == 1 {
+            self.lastCheckInfo = "\(icon) \(summaries[0].message)"
+          } else {
+            let okCount = summaries.filter { $0.level == .ok }.count
+            self.lastCheckInfo = "\(icon) \(okCount)/\(summaries.count) OK"
+          }
+        }
+
+        self.showOutput(title: title, summary: summary, details: details)
       }
     }
   }
@@ -1256,9 +1506,9 @@ Common issues and quick fixes:
     alert.runModal()
   }
 
-  private func showOutput(title: String, output: NSAttributedString) {
+  private func showOutput(title: String, summary: NSAttributedString, details: NSAttributedString? = nil) {
     guard let button = statusItem?.button else {
-      showInfo(title: title, text: output.string)
+      showInfo(title: title, text: summary.string)
       return
     }
 
@@ -1270,7 +1520,7 @@ Common issues and quick fixes:
     popover.behavior = .transient
     popover.animates = true
     popover.delegate = self
-    let controller = OutputPopoverViewController(title: title, text: output) { [weak self] in
+    let controller = OutputPopoverViewController(title: title, summary: summary, details: details) { [weak self] in
       self?.outputPopover?.performClose(nil)
       self?.outputPopover = nil
     }
@@ -1282,7 +1532,7 @@ Common issues and quick fixes:
 
   private func showHelp(title: String, body: String) {
     let attributed = formatHelp(title: title, body: body)
-    showOutput(title: "Help — \(title)", output: attributed)
+    showOutput(title: "Help — \(title)", summary: attributed)
   }
 
   func popoverDidClose(_ notification: Notification) {
@@ -1309,17 +1559,17 @@ Common issues and quick fixes:
   ) -> SummaryItem {
     switch result {
     case .failure(let err):
-      return .init(service: service, level: .error, message: "Nie udalo sie wykonac polecenia: \(err.localizedDescription)")
+      return .init(service: service, level: .error, message: "Command failed: \(err.localizedDescription)")
     case .success(let res):
       if res.exitCode != 0 || outputIndicatesFailure(res.output) {
-        let msg = failureMessage(from: res.output) ?? "Polecenie zakonczone bledem."
+        let msg = failureMessage(from: res.output) ?? "Command finished with error."
         return .init(service: service, level: .error, message: msg)
       }
 
       if script == .checkNoCurl {
         let (level, message) = summarizeCheckOutput(res.output)
         if let host = extractHost(from: extraArgs) {
-          return .init(service: service, level: level, message: "Sprawdzono: \(host). \(message)")
+          return .init(service: service, level: level, message: "Checked: \(host). \(message)")
         }
         return .init(service: service, level: level, message: message)
       }
@@ -1327,13 +1577,13 @@ Common issues and quick fixes:
       let message: String
       switch script {
       case .on:
-        message = "Reguly wlaczone (ruch tej uslugi powinien isc przez hotspot)."
+        message = "Routing enabled — traffic for this service goes through hotspot."
       case .off:
-        message = "Reguly wylaczone (ruch wraca na domyslna trase)."
+        message = "Routing disabled — traffic returns to default route."
       case .refresh:
-        message = "Reguly odswiezone (odnowiono IP dla hostow)."
+        message = "Routes refreshed — host IPs updated."
       case .checkNoCurl:
-        message = "Sprawdzono status."
+        message = "Status checked."
       }
       return .init(service: service, level: .ok, message: message)
     }
@@ -1353,16 +1603,16 @@ Common issues and quick fixes:
   private func failureMessage(from output: String) -> String? {
     let lower = output.lowercased()
     if lower.contains("brak pliku host") || lower.contains("missing hosts file") {
-      return "Brak pliku hosts.txt dla tej uslugi. Sprawdz katalog services/<nazwa>."
+      return "Missing hosts.txt for this service. Check services/<name> directory."
     }
     if lower.contains("bramy ipv4") {
-      return "Brak bramy hotspotu. Polacz z hotspotem Wi-Fi i sprobuj ponownie."
+      return "No hotspot gateway. Connect Wi-Fi hotspot and try again."
     }
     if lower.contains("run with sudo") {
-      return "Brak uprawnien administratora (sudo)."
+      return "Insufficient admin permissions (sudo)."
     }
     if lower.contains("niepraw") {
-      return "Nieprawidlowa nazwa uslugi."
+      return "Invalid service name."
     }
     return nil
   }
@@ -1382,33 +1632,33 @@ Common issues and quick fixes:
     if total == 0 {
       if hotspotDown {
         level = .error
-        message = "Hotspot Wi-Fi nie jest podlaczony."
+        message = "Hotspot is not connected. Connect your iPhone hotspot and try again."
       } else {
         level = .warn
-        message = "Nie udalo sie odczytac wyniku testu."
+        message = "No routing data to verify. Try Refresh to update routes, then check again."
       }
     } else if hotspotDown {
       level = .error
-      message = "Hotspot Wi-Fi nie jest podlaczony."
+      message = "Hotspot is not connected. Connect your iPhone hotspot and try again."
     } else if analysis.noDnsCount > 0 {
       level = .error
-      message = "Nie udalo sie znalezc adresu tej strony."
+      message = "DNS lookup failed — host could not be resolved."
     } else if analysis.notWifiCount > 0 {
       level = .error
-      message = "Ruch nie idzie przez hotspot."
+      message = "Traffic is going through the default connection instead of hotspot."
     } else {
       if analysis.okCount > 0 {
         if analysis.noV6Count > 0 {
-          message = "Dziala (IPv4). IPv6 niedostepne."
+          message = "Working (IPv4 only, IPv6 not available)."
         } else {
-          message = "Dziala."
+          message = "Working — traffic routed through hotspot."
         }
       } else if analysis.noV6Count > 0 {
         level = .warn
-        message = "IPv6 niedostepne, brak IPv4."
+        message = "IPv6 not available and no IPv4 data found."
       } else {
         level = .warn
-        message = "Brak pewnych danych o routingu."
+        message = "Check completed but results are inconclusive. See details for raw output."
       }
     }
 
@@ -1505,14 +1755,14 @@ Common issues and quick fixes:
   }
 
   private func hotspotDownMessage(wifiIf: String, wifiStatus: String?, gw4: String?) -> String {
-    var parts: [String] = ["Hotspot nieaktywny."]
+    var parts: [String] = ["Hotspot not connected."]
     if let wifiStatus {
       parts.append("Wi-Fi \(wifiIf) status: \(wifiStatus).")
     }
     if let gw4 {
-      parts.append("GW4: \(gw4).")
+      parts.append("Gateway: \(gw4).")
     }
-    parts.append("Polacz z hotspotem i kliknij REFRESH.")
+    parts.append("Connect your iPhone hotspot and click Refresh.")
     return parts.joined(separator: " ")
   }
 
@@ -1528,37 +1778,56 @@ Common issues and quick fixes:
     return args[idx + 1]
   }
 
-  private func formatOutput(summaries: [SummaryItem], details: String) -> NSAttributedString {
-    let fontSize = NSFont.smallSystemFontSize
-    let regular = NSFont.monospacedSystemFont(ofSize: fontSize, weight: .regular)
-    let bold = NSFont.monospacedSystemFont(ofSize: fontSize, weight: .bold)
+  private func networkContextString() -> String {
+    let wifi = isHotspotReachable()
+    let ethernet = isEthernetReachable()
+    var parts: [String] = []
+    parts.append("Ethernet: \(ethernet ? "connected" : "disconnected")")
+    parts.append("Wi-Fi: \(wifi ? "connected" : "disconnected")")
+    return parts.joined(separator: ", ")
+  }
+
+  private func formatSummary(summaries: [SummaryItem], networkContext: String? = nil) -> NSAttributedString {
+    let fontSize = NSFont.systemFontSize
+    let regular = NSFont.systemFont(ofSize: fontSize)
+    let bold = NSFont.boldSystemFont(ofSize: fontSize)
     let color = NSColor.labelColor
+    let secondaryColor = NSColor.secondaryLabelColor
 
     let result = NSMutableAttributedString()
-    func append(_ text: String, font: NSFont) {
-      result.append(NSAttributedString(string: text, attributes: [.font: font, .foregroundColor: color]))
+    func append(_ text: String, font: NSFont, col: NSColor = color) {
+      result.append(NSAttributedString(string: text, attributes: [.font: font, .foregroundColor: col]))
     }
 
-    append("PODSUMOWANIE\n", font: bold)
+    if let ctx = networkContext {
+      append("NETWORK: \(ctx)\n", font: NSFont.systemFont(ofSize: NSFont.smallSystemFontSize), col: secondaryColor)
+    }
+
+    append("SUMMARY\n", font: bold)
     if summaries.isEmpty {
-      append("Brak danych.\n", font: regular)
+      append("No data.\n", font: regular)
     } else {
       for item in summaries {
+        let prefix: String
         let status: String
         switch item.level {
-        case .ok: status = "OK"
-        case .warn: status = "UWAGA"
-        case .error: status = "PROBLEM"
+        case .ok:    prefix = "\u{2705}"; status = "OK"
+        case .warn:  prefix = "\u{26a0}\u{fe0f}"; status = "WARNING"
+        case .error: prefix = "\u{274c}"; status = "PROBLEM"
         }
-        append("- \(item.service): ", font: regular)
+        append("\(prefix) \(item.service): ", font: regular)
         append(status, font: bold)
-        append(" - \(item.message)\n", font: regular)
+        append(" \u{2014} \(item.message)\n", font: regular)
       }
     }
-
-    append("\nSZCZEGOLY TECHNICZNE\n", font: bold)
-    append(details, font: regular)
     return result
+  }
+
+  private func formatDetails(_ details: String) -> NSAttributedString {
+    let fontSize = NSFont.smallSystemFontSize
+    let regular = NSFont.monospacedSystemFont(ofSize: fontSize, weight: .regular)
+    let color = NSColor.labelColor
+    return NSAttributedString(string: details, attributes: [.font: regular, .foregroundColor: color])
   }
 
   private func formatHelp(title: String, body: String) -> NSAttributedString {
@@ -1572,7 +1841,7 @@ Common issues and quick fixes:
       result.append(NSAttributedString(string: text, attributes: [.font: font, .foregroundColor: color]))
     }
 
-    append("INSTRUKCJA\n", font: bold)
+    append("GUIDE\n", font: bold)
     append("\(title)\n\n", font: bold)
     append(body, font: regular)
     return result
@@ -1625,6 +1894,14 @@ Common issues and quick fixes:
       }
     }
     return nil
+  }
+
+  private func countHostLines(from file: URL) -> Int {
+    guard let text = try? String(contentsOf: file, encoding: .utf8) else { return 0 }
+    return text.split(separator: "\n", omittingEmptySubsequences: false).filter { line in
+      let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+      return !trimmed.isEmpty && !trimmed.hasPrefix("#")
+    }.count
   }
 
   private func createServiceFiles(serviceDir: URL, baseDomain: String) throws {

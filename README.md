@@ -180,12 +180,27 @@ bash scripts/build_menubar_app.sh
 open build/SplitrouteMenuBar.app
 ```
 
-Workflow:
+Versioning:
+- `CFBundleShortVersionString` = release version (from `Info.plist` or `APP_VERSION` env).
+- `CFBundleVersion` = numeric build number, auto-generated per build (timestamp), can be overridden by `APP_BUILD`.
+- If HEAD is exactly on tag `vX.Y` or `vX.Y.Z`, build uses that tag as `CFBundleShortVersionString` (unless `APP_VERSION` is provided).
+
+Example:
 ```bash
-bash scripts/workflow_menubar_app.sh
-# or install to /Applications
+APP_VERSION=0.2.1 APP_BUILD=20260303104500 bash scripts/build_menubar_app.sh
+```
+
+Workflow (official install target: `/Applications` only):
+```bash
 sudo bash scripts/workflow_menubar_app.sh
 ```
+
+The workflow:
+- builds the app,
+- installs to `/Applications/SplitrouteMenuBar.app`,
+- verifies installed app matches local build (`scripts/verify_menubar_install.sh`),
+- launches `/Applications/SplitrouteMenuBar.app`,
+- packages DMG/ZIP.
 
 Package:
 ```bash
@@ -199,7 +214,7 @@ If DMG creation fails, the script creates `build/SplitrouteMenuBar.zip`.
 
 1. Build/install/package:
 ```bash
-sudo bash scripts/workflow_menubar_app.sh
+sudo APP_VERSION=0.2.1 bash scripts/workflow_menubar_app.sh
 ```
 
 2. Commit and tag:
@@ -230,3 +245,4 @@ gh release create v0.x build/SplitrouteMenuBar.zip -t "v0.x" -n "Release v0.x"
 - `Check connections` verifies route behavior without changing config.
 - `Add Service...` can create a basic service or run Smart Host Discovery (explicit opt-in).
 - `Touch ID (sudo)` requires `pam_tid.so` in `/etc/pam.d/sudo`.
+- Developer signing/notarization is intentionally separate from this local build workflow.
